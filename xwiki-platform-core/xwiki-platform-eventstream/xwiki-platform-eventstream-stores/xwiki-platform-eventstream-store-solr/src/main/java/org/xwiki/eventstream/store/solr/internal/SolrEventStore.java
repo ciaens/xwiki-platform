@@ -33,6 +33,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
 
 import javax.inject.Inject;
 import javax.inject.Named;
@@ -40,6 +41,7 @@ import javax.inject.Singleton;
 
 import org.apache.commons.collections4.CollectionUtils;
 import org.apache.commons.lang3.StringUtils;
+import org.apache.commons.lang3.exception.ExceptionUtils;
 import org.apache.solr.client.solrj.SolrClient;
 import org.apache.solr.client.solrj.SolrQuery;
 import org.apache.solr.client.solrj.SolrQuery.ORDER;
@@ -49,7 +51,6 @@ import org.apache.solr.common.SolrDocument;
 import org.apache.solr.common.SolrDocumentList;
 import org.apache.solr.common.SolrInputDocument;
 import org.xwiki.component.annotation.Component;
-import org.xwiki.component.phase.InitializationException;
 import org.xwiki.eventstream.EntityEvent;
 import org.xwiki.eventstream.Event;
 import org.xwiki.eventstream.Event.Importance;
@@ -84,6 +85,7 @@ import org.xwiki.search.solr.AbstractSolrCoreInitializer;
 import org.xwiki.search.solr.Solr;
 import org.xwiki.search.solr.SolrException;
 import org.xwiki.search.solr.SolrUtils;
+import org.xwiki.search.solr.XWikiSolrCore;
 
 /**
  * Solr based implementation of {@link EventStore}.
@@ -112,6 +114,11 @@ public class SolrEventStore extends AbstractAsynchronousEventStore
     private static final String FAILED_COMMIT = "Failed to commit";
 
     private static final String FAILED_QUERY = "Failed to execute Solr query";
+
+    /**
+     * The minimum time between two attempts to get the events core after a failure.
+     */
+    private static final long RETRY_DELAY = TimeUnit.SECONDS.toNanos(10);
 
     private static final class SearchFieldMapping
     {
@@ -163,18 +170,105 @@ public class SolrEventStore extends AbstractAsynchronousEventStore
     @Named("compactwiki")
     private EntityReferenceSerializer<String> compactwiki;
 
-    private SolrClient client;
+    private volatile SolrClient client;
+
+    /**
+     * The last failure to get the events core, {@code null} if the last attempt succeeded. Guarded by this.
+     */
+    private SolrServerException failure;
+
+    /**
+     * The time ({@link System#nanoTime()}) before which the events core is not requested again after a failure.
+     * Guarded by this.
+     */
+    private long retryTime;
 
     @Override
-    public void initialize() throws InitializationException
+    public void initialize()
     {
+        // Try to get the events core now, so that it is created, migrated and initialized during the startup, but don't
+        // fail: a Solr server which cannot be reached while XWiki starts must not make the event store, and all the
+        // components which depend on it (the event listeners recording events or dispatching notifications for
+        // example), unavailable until XWiki is restarted. The events core is requested again when needed.
         try {
-            this.client = this.solr.getClient(EventsSolrCoreInitializer.NAME);
-        } catch (SolrException e) {
-            throw new InitializationException("Failed to get the events Solr core", e);
+            getClient();
+        } catch (SolrServerException e) {
+            // Already logged
         }
 
         initialize(100, false, true);
+    }
+
+    /**
+     * Get the client of the events core, resolving it the first time it's needed. After a failure, the events core is
+     * requested again when needed, but not before {@link #RETRY_DELAY}, so that Solr is not contacted for each event
+     * while it's not available.
+     *
+     * @return the client of the events core
+     * @throws SolrServerException when failing to get the events core
+     */
+    private SolrClient getClient() throws SolrServerException
+    {
+        SolrClient solrClient = this.client;
+
+        return solrClient != null ? solrClient : resolveClient();
+    }
+
+    private synchronized SolrClient resolveClient() throws SolrServerException
+    {
+        if (this.client == null) {
+            if (this.failure != null && System.nanoTime() - this.retryTime < 0) {
+                throw new SolrServerException(this.failure.getMessage(), this.failure.getCause());
+            }
+
+            try {
+                this.client = getEventsCore().getClient();
+            } catch (SolrServerException e) {
+                onFailure(e);
+
+                throw e;
+            }
+
+            if (this.failure != null) {
+                this.logger.info("The events Solr core is available again");
+
+                this.failure = null;
+            }
+        }
+
+        return this.client;
+    }
+
+    private XWikiSolrCore getEventsCore() throws SolrServerException
+    {
+        XWikiSolrCore core;
+        try {
+            core = this.solr.getCore(EventsSolrCoreInitializer.NAME);
+        } catch (SolrException e) {
+            throw new SolrServerException("Failed to get the events Solr core", e);
+        }
+
+        if (core == null) {
+            throw new SolrServerException("The events Solr core could not be found: with a remote Solr server it must"
+                + " be created beforehand, with the name [<corePrefix>_events_<Solr major version>]");
+        }
+
+        return core;
+    }
+
+    private void onFailure(SolrServerException e)
+    {
+        if (this.failure == null) {
+            this.logger.warn("The events Solr core is not available, events cannot be stored or searched: [{}]."
+                + " Check that the Solr server can be reached and that the events core exists on it."
+                + " The events core will be requested again when needed.", ExceptionUtils.getRootCauseMessage(e));
+        } else {
+            this.logger.debug("The events Solr core is still not available: [{}]",
+                ExceptionUtils.getRootCauseMessage(e));
+        }
+
+        this.failure = e;
+        this.retryTime = System.nanoTime() + RETRY_DELAY;
     }
 
     @Override
@@ -193,7 +287,7 @@ public class SolrEventStore extends AbstractAsynchronousEventStore
     protected Event syncSaveEvent(Event event) throws EventStreamException
     {
         try {
-            this.client.add(toSolrInputDocument(event));
+            getClient().add(toSolrInputDocument(event));
         } catch (Exception e) {
             throw new EventStreamException("Failed to save event", e);
         }
@@ -263,7 +357,7 @@ public class SolrEventStore extends AbstractAsynchronousEventStore
         this.utils.setAtomic(SolrUtils.ATOMIC_UPDATE_MODIFIER_SET, Event.FIELD_PREFILTERING_DATE, new Date(), document);
 
         try {
-            this.client.add(document);
+            getClient().add(document);
         } catch (Exception e) {
             throw new EventStreamException(
                 String.format("Failed to to set the event [%s] as prefiltered", event.getId()), e);
@@ -292,7 +386,7 @@ public class SolrEventStore extends AbstractAsynchronousEventStore
             EventsSolrCoreInitializer.SOLR_FIELD_UNREADLISTENERS, entityId, document);
 
         try {
-            this.client.add(document);
+            getClient().add(document);
         } catch (Exception e) {
             throw new EventStreamException(
                 String.format("Failed to update the event status for event [%s] and entity id [%s]", eventId, entityId),
@@ -311,7 +405,7 @@ public class SolrEventStore extends AbstractAsynchronousEventStore
             EventsSolrCoreInitializer.SOLR_FIELD_MAILLISTENERS, entityId, document);
 
         try {
-            this.client.add(document);
+            getClient().add(document);
         } catch (Exception e) {
             throw new EventStreamException(String.format(
                 "Failed to update the event mail status for event [%s] and entity id [%s]", eventId, entityId), e);
@@ -390,7 +484,7 @@ public class SolrEventStore extends AbstractAsynchronousEventStore
     private void deleteById(String eventId) throws EventStreamException
     {
         try {
-            this.client.deleteById(eventId);
+            getClient().deleteById(eventId);
         } catch (Exception e) {
             throw new EventStreamException("Failed to delete the event", e);
         }
@@ -398,10 +492,15 @@ public class SolrEventStore extends AbstractAsynchronousEventStore
 
     private void commit() throws EventStreamException
     {
-        try {
-            this.client.commit();
-        } catch (Exception e) {
-            throw new EventStreamException(FAILED_COMMIT, e);
+        // Nothing can have been written if the events core was never reached
+        SolrClient solrClient = this.client;
+
+        if (solrClient != null) {
+            try {
+                solrClient.commit();
+            } catch (Exception e) {
+                throw new EventStreamException(FAILED_COMMIT, e);
+            }
         }
     }
 
@@ -413,7 +512,7 @@ public class SolrEventStore extends AbstractAsynchronousEventStore
      */
     public SolrDocument getEventDocument(String eventId) throws SolrServerException, IOException
     {
-        return this.client.getById(eventId);
+        return getClient().getById(eventId);
     }
 
     @Override
@@ -445,7 +544,7 @@ public class SolrEventStore extends AbstractAsynchronousEventStore
 
         QueryResponse response;
         try {
-            response = this.client.query(solrQuery);
+            response = getClient().query(solrQuery);
         } catch (Exception e) {
             throw new EventStreamException(FAILED_QUERY, e);
         }
@@ -861,7 +960,7 @@ public class SolrEventStore extends AbstractAsynchronousEventStore
 
         QueryResponse response;
         try {
-            response = this.client.query(solrQuery);
+            response = getClient().query(solrQuery);
         } catch (Exception e) {
             throw new EventStreamException(FAILED_QUERY, e);
         }
