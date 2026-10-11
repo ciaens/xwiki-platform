@@ -129,4 +129,16 @@ public interface SolrConfiguration
      * @since 16.4.7
      */
     int getSynchronizationBatchSize();
+
+    /**
+     * With a remote Solr server in a cluster, gives the delay before a member which becomes the cluster singleton node
+     * synchronizes the index (nothing is done if the member is not the singleton node anymore when the delay expires).
+     *
+     * @return the delay in seconds, {@code 60} by default, {@code 0} or less to synchronize immediately
+     * @since 18.9.0RC1
+     */
+    default int getSynchronizeOnSingletonGainDelay()
+    {
+        return 60;
+    }
 }

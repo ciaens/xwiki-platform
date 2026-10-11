@@ -22,6 +22,11 @@ package org.xwiki.search.solr.internal;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 
 import javax.inject.Inject;
 import javax.inject.Named;
@@ -32,9 +37,12 @@ import org.slf4j.Logger;
 import org.xwiki.bridge.event.ApplicationReadyEvent;
 import org.xwiki.bridge.event.WikiReadyEvent;
 import org.xwiki.component.annotation.Component;
+import org.xwiki.component.manager.ComponentManager;
+import org.xwiki.component.phase.Disposable;
+import org.xwiki.context.concurrent.ExecutionContextRunnable;
 import org.xwiki.model.reference.EntityReferenceSerializer;
 import org.xwiki.model.reference.WikiReference;
-import org.xwiki.observation.EventListener;
+import org.xwiki.observation.event.AbstractClusterSingletonListener;
 import org.xwiki.observation.event.Event;
 import org.xwiki.search.solr.internal.api.SolrConfiguration;
 import org.xwiki.search.solr.internal.api.SolrIndexer;
@@ -45,6 +53,12 @@ import org.xwiki.wiki.manager.WikiManagerException;
 
 /**
  * Automatically start synchronization at startup.
+ * <p>
+ * When the Solr server is shared by all the members of the cluster ({@code solr.type=remote}), the synchronization runs
+ * only on the cluster singleton node, for the whole farm (whatever {@code solr.synchronizeAtStartupMode} says, the
+ * singleton node might never load the subwikis): at startup, and when the current instance becomes the singleton node
+ * (because the previous one stopped, possibly in the middle of a synchronization), after a delay and only if it's
+ * still the singleton node. Otherwise each instance synchronizes its own index at startup.
  * 
  * @version $Id$
  * @since 5.1RC1
@@ -52,13 +66,8 @@ import org.xwiki.wiki.manager.WikiManagerException;
 @Component
 @Named("solr.initializer")
 @Singleton
-public class SolrIndexInitializeListener implements EventListener
+public class SolrIndexInitializeListener extends AbstractClusterSingletonListener implements Disposable
 {
-    /**
-     * The events to listen to that trigger the index update.
-     */
-    private static final List<Event> EVENTS = Arrays.<Event> asList(new ApplicationReadyEvent(), new WikiReadyEvent());
-
     private static final List<String> REQUEST_DEFAULT_ID = Arrays.asList("solr", "indexer");
 
     /**
@@ -84,59 +93,144 @@ public class SolrIndexInitializeListener implements EventListener
     @Inject
     private WikiDescriptorManager wikiDescriptorManager;
 
-    @Override
-    public List<Event> getEvents()
+    @Inject
+    private ComponentManager componentManager;
+
+    /**
+     * Used to delay the synchronization when the current instance becomes the cluster singleton node (the thread is
+     * only created when the first task is scheduled).
+     */
+    private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor(runnable -> {
+        Thread thread = new Thread(runnable, "XWiki Solr singleton node synchronization");
+        thread.setDaemon(true);
+        return thread;
+    });
+
+    private Future<?> pendingSynchronization;
+
+    /**
+     * Listen to the events that trigger the index synchronization.
+     */
+    public SolrIndexInitializeListener()
     {
-        return EVENTS;
+        super(SolrIndexInitializeListener.class.getName(), new ApplicationReadyEvent(), new WikiReadyEvent());
     }
 
     @Override
-    public String getName()
+    protected boolean isSingletonNodeRequired()
     {
-        return this.getClass().getName();
+        // Each instance has its own embedded index, but a remote index is shared by all the members of the cluster
+        return RemoteSolr.TYPE.equals(this.configuration.getServerType());
     }
 
     @Override
-    public void onEvent(Event event, Object source, Object data)
+    protected void processSingletonEvent(Event event, Object source, Object data)
     {
         if (this.configuration.synchronizeAtStartup()) {
-            SolrConfiguration.SynchronizeAtStartupMode startupMode =
-                this.configuration.synchronizeAtStartupMode();
-            IndexerRequest request = null;
-            ArrayList<String> requestId = new ArrayList<>(REQUEST_DEFAULT_ID);
-
             try {
-                if (event instanceof ApplicationReadyEvent) {
-                    if (startupMode == SolrConfiguration.SynchronizeAtStartupMode.FARM) {
-                        request = new IndexerRequest();
-                        request.setId(requestId);
-                    } else if (startupMode == SolrConfiguration.SynchronizeAtStartupMode.WIKI) {
-                        // Startup of the application: start indexing the main wiki.
-                        request = new IndexerRequest();
-                        WikiReference wikiReference = this.wikiDescriptorManager.getMainWikiDescriptor().getReference();
-                        request.setRootReference(wikiReference);
-                        requestId.add(this.entityReferenceSerializer.serialize(wikiReference));
-                        request.setId(requestId);
+                if (isSingletonNodeRequired()) {
+                    // A single job for the whole farm: the subwikis are loaded on the first request reaching them,
+                    // which might never happen on the singleton node (for example an instance dedicated to
+                    // background tasks)
+                    if (event instanceof ApplicationReadyEvent) {
+                        startIndex(null);
                     }
-                } else if (startupMode == SolrConfiguration.SynchronizeAtStartupMode.WIKI
-                    && event instanceof WikiReadyEvent wikiReadyEvent) {
-                    WikiReference wikiReference = new WikiReference(wikiReadyEvent.getWikiId());
-                    request = new IndexerRequest();
-                    request.setRootReference(wikiReference);
-
-                    requestId.add(this.entityReferenceSerializer.serialize(wikiReference));
-                    request.setId(requestId);
-                }
-
-                if (request != null) {
-                    // Remove invalid entries after the synchronization
-                    request.setCleanInvalid(true);
-
-                    this.solrIndexer.get().startIndex(request);
+                } else {
+                    synchronize(event);
                 }
             } catch (SolrIndexerException | WikiManagerException e) {
                 this.logger.error("Failed to start initial Solr index synchronization", e);
             }
         }
+    }
+
+    @Override
+    protected void onSingletonNodeGained()
+    {
+        if (this.configuration.synchronizeAtStartup()) {
+            // The previous singleton node might have stopped before (or while) synchronizing the index, but it might
+            // also come back soon (restart of the preferred member): wait a bit before synchronizing
+            synchronized (this) {
+                if (this.pendingSynchronization == null || this.pendingSynchronization.isDone()) {
+                    int delay = this.configuration.getSynchronizeOnSingletonGainDelay();
+                    this.logger.info("This instance became the cluster singleton node: the Solr index will be"
+                        + " synchronized in [{}] seconds if it is still the singleton node", Math.max(delay, 0));
+                    try {
+                        this.pendingSynchronization = this.scheduler.schedule(
+                            new ExecutionContextRunnable(this::synchronizeIfSingletonNode, this.componentManager),
+                            delay, TimeUnit.SECONDS);
+                    } catch (RejectedExecutionException e) {
+                        // The component is disposed: the instance is stopping
+                        this.logger.debug("Ignoring the singleton node synchronization of a disposed listener", e);
+                    }
+                }
+            }
+        }
+    }
+
+    @Override
+    protected void onSingletonNodeLost()
+    {
+        synchronized (this) {
+            if (this.pendingSynchronization != null) {
+                this.pendingSynchronization.cancel(false);
+            }
+        }
+    }
+
+    private void synchronizeIfSingletonNode()
+    {
+        if (this.singletonManager.isSingletonNode() && this.configuration.synchronizeAtStartup()) {
+            try {
+                startIndex(null);
+            } catch (SolrIndexerException e) {
+                this.logger.error("Failed to start the Solr index synchronization of the new cluster singleton node",
+                    e);
+            }
+        }
+    }
+
+    private void synchronize(Event event) throws SolrIndexerException, WikiManagerException
+    {
+        SolrConfiguration.SynchronizeAtStartupMode startupMode = this.configuration.synchronizeAtStartupMode();
+
+        if (event instanceof ApplicationReadyEvent) {
+            if (startupMode == SolrConfiguration.SynchronizeAtStartupMode.FARM) {
+                startIndex(null);
+            } else if (startupMode == SolrConfiguration.SynchronizeAtStartupMode.WIKI) {
+                // Startup of the application: start indexing the main wiki.
+                startIndex(this.wikiDescriptorManager.getMainWikiDescriptor().getReference());
+            }
+        } else if (startupMode == SolrConfiguration.SynchronizeAtStartupMode.WIKI
+            && event instanceof WikiReadyEvent wikiReadyEvent) {
+            startIndex(new WikiReference(wikiReadyEvent.getWikiId()));
+        }
+    }
+
+    /**
+     * @param wikiReference the wiki to synchronize, {@code null} for the whole farm
+     */
+    private void startIndex(WikiReference wikiReference) throws SolrIndexerException
+    {
+        IndexerRequest request = new IndexerRequest();
+        List<String> requestId = new ArrayList<>(REQUEST_DEFAULT_ID);
+
+        if (wikiReference != null) {
+            request.setRootReference(wikiReference);
+            requestId.add(this.entityReferenceSerializer.serialize(wikiReference));
+        }
+
+        request.setId(requestId);
+
+        // Remove invalid entries after the synchronization
+        request.setCleanInvalid(true);
+
+        this.solrIndexer.get().startIndex(request);
+    }
+
+    @Override
+    public void dispose()
+    {
+        this.scheduler.shutdownNow();
     }
 }
