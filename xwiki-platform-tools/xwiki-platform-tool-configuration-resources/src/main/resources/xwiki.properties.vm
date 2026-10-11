@@ -602,6 +602,16 @@ rendering.transformations = $xwikiRenderingTransformations
 #-# The default value is 60000 for 60 000ms.
 # job.groupedJobThreadKeepAliveTime = 60000
 
+#-# [Since 18.9.0RC1]
+#-# The maximum time in milliseconds to wait for the running jobs to finish when XWiki stops. The jobs still running
+#-# after this time are interrupted: their status is stored as canceled (with the interruption as error) and they are
+#-# given 5 seconds to save it before the shutdown continues. Set it to 0 to interrupt the running jobs immediately
+#-# (without waiting for them to save their status). Note that the stop grace period given to XWiki (for example
+#-# terminationGracePeriodSeconds in Kubernetes) should cover this timeout plus about 5 seconds of interruption grace
+#-# and up to 10 seconds for the job status store to finish writing the statuses.
+#-# The default value is 30000 for 30 000ms.
+# job.shutdownTimeout = 30000
+
 #-------------------------------------------------------------------------------------
 # Extension Manager
 #-------------------------------------------------------------------------------------
