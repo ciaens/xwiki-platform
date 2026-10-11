@@ -500,6 +500,10 @@ rendering.transformations = $xwikiRenderingTransformations
 #-# [Since 17.5.0]
 #-# Indicate the unique identifier of the instance among the members of a cluster.
 #-# By default it is automatically generated from a UUID and stored in the permanent directory.
+#-# The identifier must stay the same when the instance is restarted (keep the permanent directory or set this
+#-# property): the events produced by the instance are associated with it, and a cluster member pre-filters the
+#-# events and resumes the pending live notification mails associated with its own identifier (the cluster singleton
+#-# node also handles the events without identifier), so the events of an identifier which disappeared are not handled.
 #-# 
 # observation.remote.id = node1
 
