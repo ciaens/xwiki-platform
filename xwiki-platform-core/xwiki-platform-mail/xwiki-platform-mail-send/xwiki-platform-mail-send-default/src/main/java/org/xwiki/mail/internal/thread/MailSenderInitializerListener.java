@@ -64,6 +64,12 @@ public class MailSenderInitializerListener implements EventListener, Disposable
      */
     private static final Logger SHUTDOWN_LOGGER = LoggerFactory.getLogger("org.xwiki.shutdown");
 
+    /**
+     * The maximum time in milliseconds to wait for the mail threads to stop. A thread stuck in a network operation
+     * would otherwise block the whole shutdown of the application.
+     */
+    private static final long STOP_TIMEOUT = 30000L;
+
     @Inject
     @Named("prepare")
     private MailRunnable prepareMailRunnable;
@@ -112,26 +118,32 @@ public class MailSenderInitializerListener implements EventListener, Disposable
      */
     private void stopMailThreads() throws InterruptedException
     {
-        // Step 1: Stop the Mail Sender Thread
+        // The timeout is shared by the two threads
+        long deadline = System.currentTimeMillis() + STOP_TIMEOUT;
 
-        if (this.sendMailThread != null) {
-            this.sendMailRunnable.stopProcessing();
-            // Make sure the Thread goes out of sleep if it's sleeping so that it stops immediately.
-            this.sendMailThread.interrupt();
-            // Wait till the thread goes away
-            this.sendMailThread.join();
-            SHUTDOWN_LOGGER.debug("Mail Sender Thread has been stopped");
-        }
+        // Step 1: Stop the Mail Sender Thread
+        stopMailThread(this.sendMailThread, this.sendMailRunnable, deadline);
 
         // Step 2: Stop the Mail Prepare Thread
+        stopMailThread(this.prepareMailThread, this.prepareMailRunnable, deadline);
+    }
 
-        if (this.prepareMailThread != null) {
-            this.prepareMailRunnable.stopProcessing();
+    private void stopMailThread(Thread thread, MailRunnable runnable, long deadline) throws InterruptedException
+    {
+        if (thread != null) {
+            runnable.stopProcessing();
             // Make sure the Thread goes out of sleep if it's sleeping so that it stops immediately.
-            this.prepareMailThread.interrupt();
-            // Wait till the thread goes away
-            this.prepareMailThread.join();
-            SHUTDOWN_LOGGER.debug("Mail Prepare Thread has been stopped");
+            thread.interrupt();
+            // Wait till the thread goes away, but not forever
+            long remaining = deadline - System.currentTimeMillis();
+            if (remaining > 0) {
+                thread.join(remaining);
+            }
+            if (thread.isAlive()) {
+                SHUTDOWN_LOGGER.warn("[{}] is still running after [{}]ms", thread.getName(), STOP_TIMEOUT);
+            } else {
+                SHUTDOWN_LOGGER.debug("[{}] has been stopped", thread.getName());
+            }
         }
     }
 
