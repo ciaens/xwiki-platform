@@ -19,6 +19,7 @@
  */
 package org.xwiki.eventstream.internal;
 
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Date;
 import java.util.List;
@@ -27,11 +28,16 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.BooleanSupplier;
 
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.RegisterExtension;
 import org.xwiki.component.phase.InitializationException;
+import org.xwiki.context.concurrent.ContextStoreManager;
 import org.xwiki.eventstream.EntityEvent;
 import org.xwiki.eventstream.Event;
 import org.xwiki.eventstream.EventQuery;
@@ -43,6 +49,8 @@ import org.xwiki.eventstream.events.EventStreamAddedEvent;
 import org.xwiki.eventstream.events.MailEntityAddedEvent;
 import org.xwiki.eventstream.events.MailEntityDeleteEvent;
 import org.xwiki.observation.ObservationManager;
+import org.xwiki.test.LogLevel;
+import org.xwiki.test.junit5.LogCaptureExtension;
 import org.xwiki.test.junit5.mockito.ComponentTest;
 import org.xwiki.test.junit5.mockito.InjectComponentManager;
 import org.xwiki.test.junit5.mockito.InjectMockComponents;
@@ -51,9 +59,12 @@ import org.xwiki.test.mockito.MockitoComponentManager;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.fail;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.*;
@@ -269,6 +280,9 @@ class AsynchronousEventStoreTest
         }
     }
 
+    @RegisterExtension
+    private LogCaptureExtension logCapture = new LogCaptureExtension(LogLevel.WARN);
+
     @InjectComponentManager
     private MockitoComponentManager componentManager;
 
@@ -277,6 +291,9 @@ class AsynchronousEventStoreTest
 
     @MockComponent
     private ObservationManager observation;
+
+    @MockComponent
+    private ContextStoreManager contextStore;
 
     private DefaultEvent event(String id)
     {
@@ -465,6 +482,166 @@ class AsynchronousEventStoreTest
 
         assertTrue(this.store.getEvent(event1.getId()).get().isPrefiltered());
         assertFalse(this.store.getEvent(event2.getId()).get().isPrefiltered());
+    }
+
+    @Test
+    void disposeProcessesQueuedTasks() throws Exception
+    {
+        List<CompletableFuture<Event>> futures = new ArrayList<>();
+
+        // Block the store thread on the first task and fill the queue (capacity 10) behind it, so that the queued tasks
+        // don't fit in a single batch
+        this.store.lock.lock();
+        try {
+            futures.add(this.store.saveEvent(event("id0")));
+            await(this.store.lock::hasQueuedThreads);
+            for (int i = 1; i <= 10; ++i) {
+                futures.add(this.store.saveEvent(event("id" + i)));
+            }
+
+            // Dispose the store while the queue is full
+            Thread disposeThread = new Thread(() -> {
+                try {
+                    this.store.dispose();
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+            });
+            disposeThread.start();
+
+            // Wait for the dispose to wait for room in the queue for the stop order
+            await(() -> disposeThread.getState() == Thread.State.TIMED_WAITING);
+
+            // New tasks are refused as soon as the store is being disposed
+            assertTrue(this.store.saveEvent(event("refused")).isCompletedExceptionally());
+
+            this.store.lock.unlock();
+
+            disposeThread.join(10000);
+            assertFalse(disposeThread.isAlive());
+        } finally {
+            if (this.store.lock.isHeldByCurrentThread()) {
+                this.store.lock.unlock();
+            }
+        }
+
+        // All the tasks accepted before the dispose have been processed
+        for (int i = 0; i <= 10; ++i) {
+            assertEquals("id" + i, futures.get(i).get(0, TimeUnit.SECONDS).getId());
+            assertTrue(this.store.getEvent("id" + i).isPresent());
+        }
+        assertFalse(this.store.getEvent("refused").isPresent());
+    }
+
+    @Test
+    void disposeInterruptedWhileTheStoreIsStuck() throws Exception
+    {
+        List<CompletableFuture<Event>> futures = new ArrayList<>();
+
+        // Block the store thread on the first task and fill the queue behind it
+        this.store.lock.lock();
+        try {
+            futures.add(this.store.saveEvent(event("id0")));
+            await(this.store.lock::hasQueuedThreads);
+            for (int i = 1; i <= 10; ++i) {
+                futures.add(this.store.saveEvent(event("id" + i)));
+            }
+
+            Thread disposeThread = new Thread(() -> {
+                try {
+                    this.store.dispose();
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+            });
+            disposeThread.start();
+            await(() -> disposeThread.getState() == Thread.State.TIMED_WAITING);
+
+            // Stop waiting for the stuck store thread
+            disposeThread.interrupt();
+            disposeThread.join(10000);
+            assertFalse(disposeThread.isAlive());
+
+            // The tasks still in the queue have been failed
+            for (int i = 1; i <= 10; ++i) {
+                ExecutionException exception = assertThrows(ExecutionException.class, futures.get(i)::get);
+                assertInstanceOf(EventStreamException.class, exception.getCause());
+            }
+        } finally {
+            this.store.lock.unlock();
+        }
+
+        // The task being processed when the store was disposed is finished
+        assertEquals("id0", futures.get(0).get().getId());
+
+        String storeThread = "The thread handling asynchronous storage for event store [";
+        assertTrue(this.logCapture.getMessage(0).startsWith("Interrupted while waiting for the event store ["));
+        assertTrue(this.logCapture.getMessage(0).endsWith("] to process its queued tasks: [InterruptedException: ]"));
+        assertTrue(this.logCapture.getMessage(1).startsWith(storeThread));
+        assertTrue(
+            this.logCapture.getMessage(1).endsWith("] did not finish processing the queued tasks in [10] seconds"));
+        assertTrue(this.logCapture.getMessage(2).startsWith("[10] tasks were not processed before the event store ["));
+    }
+
+    @Test
+    void saveEventWhileDisposing() throws Exception
+    {
+        // Block a producer after it checked that the store is not disposed, but before its task is queued
+        CountDownLatch saving = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        when(this.contextStore.save(any())).thenAnswer(invocation -> {
+            saving.countDown();
+            release.await();
+            return null;
+        });
+
+        CompletableFuture<CompletableFuture<Event>> producer =
+            CompletableFuture.supplyAsync(() -> this.store.saveEvent(event("late")));
+        assertTrue(saving.await(10, TimeUnit.SECONDS));
+
+        // The store is disposed (and its thread stopped) before the task is queued
+        this.store.dispose();
+        release.countDown();
+
+        // The task is not left pending
+        CompletableFuture<Event> future = producer.get(10, TimeUnit.SECONDS);
+        ExecutionException exception =
+            assertThrows(ExecutionException.class, () -> future.get(10, TimeUnit.SECONDS));
+        assertInstanceOf(EventStreamException.class, exception.getCause());
+        assertFalse(this.store.getEvent("late").isPresent());
+    }
+
+    @Test
+    void saveEventAfterDispose() throws Exception
+    {
+        this.store.saveEvent(event("id1")).get();
+
+        this.store.dispose();
+
+        CompletableFuture<Event> future = this.store.saveEvent(event("id2"));
+
+        ExecutionException exception = assertThrows(ExecutionException.class, future::get);
+        assertInstanceOf(EventStreamException.class, exception.getCause());
+        assertTrue(exception.getCause().getMessage().endsWith("is disposed"));
+        assertTrue(this.store.getEvent("id1").isPresent());
+        assertFalse(this.store.getEvent("id2").isPresent());
+        assertEquals(0, this.store.getQueueSize());
+    }
+
+    /**
+     * Wait for a condition, failing the test if it's not met in 10 seconds.
+     *
+     * @param condition the condition to wait for
+     */
+    private static void await(BooleanSupplier condition) throws InterruptedException
+    {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+        while (!condition.getAsBoolean()) {
+            if (System.nanoTime() > deadline) {
+                fail("The condition was not met in 10 seconds");
+            }
+            Thread.sleep(1);
+        }
     }
 
     /**

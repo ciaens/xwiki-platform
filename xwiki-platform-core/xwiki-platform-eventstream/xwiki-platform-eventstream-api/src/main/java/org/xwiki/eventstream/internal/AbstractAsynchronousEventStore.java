@@ -29,9 +29,11 @@ import java.util.Optional;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.TimeUnit;
 
 import javax.inject.Inject;
 
+import org.apache.commons.lang3.exception.ExceptionUtils;
 import org.slf4j.Logger;
 import org.xwiki.component.descriptor.ComponentDescriptor;
 import org.xwiki.component.manager.ComponentLifecycleException;
@@ -63,6 +65,11 @@ import org.xwiki.observation.ObservationManager;
 public abstract class AbstractAsynchronousEventStore implements EventStore, Initializable, Disposable
 {
     private static final List<String> CONTEXT_ENTRIES = Arrays.asList("user", "author", "wiki");
+
+    /**
+     * The maximum time to wait, when the store is disposed, for the tasks already queued to be processed.
+     */
+    private static final long DISPOSE_TIMEOUT = TimeUnit.SECONDS.toNanos(10);
 
     /**
      * The type of task.
@@ -193,7 +200,7 @@ public abstract class AbstractAsynchronousEventStore implements EventStore, Init
 
     private boolean notifyAll;
 
-    private boolean disposed;
+    private volatile boolean disposed;
 
     /**
      * Give an estimation of the number of events that are going to be added to the store. Can be negative if there is
@@ -208,6 +215,10 @@ public abstract class AbstractAsynchronousEventStore implements EventStore, Init
     {
         int size = 0;
         for (EventStoreTask<?, ?> task : this.queue) {
+            if (task == EventStoreTask.STOP) {
+                continue;
+            }
+
             switch (task.type) {
                 case DELETE_EVENT, DELETE_EVENT_BY_ID:
                     --size;
@@ -225,6 +236,13 @@ public abstract class AbstractAsynchronousEventStore implements EventStore, Init
 
     private <O, I> CompletableFuture<O> addTask(I input, EventStoreTaskType type)
     {
+        // The store is being stopped: the tasks accepted before are being processed, but no new task is accepted since
+        // the processing thread is going to stop and the resources it relies on (a Solr client for example) are going
+        // to be closed
+        if (this.disposed) {
+            return CompletableFuture.failedFuture(new EventStreamException(getDisposedMessage()));
+        }
+
         // Remember a few standard things from the context
         Map<String, Serializable> context;
         try {
@@ -246,6 +264,12 @@ public abstract class AbstractAsynchronousEventStore implements EventStore, Init
     {
         try {
             this.queue.put(task);
+
+            // The store was disposed while the task was being queued: the processing thread may already be gone, so
+            // take the task back, unless the processing thread already took it
+            if (this.disposed && this.queue.remove(task)) {
+                task.future.completeExceptionally(new EventStreamException(getDisposedMessage()));
+            }
         } catch (InterruptedException e) {
             task.future.completeExceptionally(e);
 
@@ -309,7 +333,10 @@ public abstract class AbstractAsynchronousEventStore implements EventStore, Init
 
     private void run()
     {
-        while (!this.disposed) {
+        boolean stopped = false;
+        // Stop when the stop order is reached, or when the store is disposed and all the tasks accepted before have
+        // been processed
+        while (!stopped && !(this.disposed && this.queue.isEmpty())) {
             EventStoreTask<?, ?> firstTask;
             try {
                 firstTask = this.queue.take();
@@ -321,12 +348,20 @@ public abstract class AbstractAsynchronousEventStore implements EventStore, Init
                 break;
             }
 
-            processTasks(firstTask);
+            stopped = processTasks(firstTask);
         }
     }
 
-    private void processTasks(EventStoreTask<?, ?> firstTask)
+    /**
+     * Process a batch of tasks.
+     *
+     * @param firstTask the first task of the batch
+     * @return {@code true} if the stop order was reached
+     */
+    private boolean processTasks(EventStoreTask<?, ?> firstTask)
     {
+        boolean stop = false;
+
         this.execution.setContext(new ExecutionContext());
 
         // Make sure to not treat more than the queue capacity in a single batch
@@ -334,6 +369,7 @@ public abstract class AbstractAsynchronousEventStore implements EventStore, Init
         try {
             for (EventStoreTask<?, ?> task = firstTask; task != null; task = this.queue.poll()) {
                 if (task == EventStoreTask.STOP) {
+                    stop = true;
                     break;
                 }
 
@@ -359,6 +395,8 @@ public abstract class AbstractAsynchronousEventStore implements EventStore, Init
 
             this.execution.removeContext();
         }
+
+        return stop;
     }
 
     private boolean processTask(EventStoreTask<?, ?> task) throws EventStreamException
@@ -566,19 +604,59 @@ public abstract class AbstractAsynchronousEventStore implements EventStore, Init
     @Override
     public void dispose() throws ComponentLifecycleException
     {
+        // Stop accepting new tasks
         this.disposed = true;
 
-        // Make sure to wake up the thread
-        addTask(EventStoreTask.STOP);
-
-        // Wait for the processing to be over but not more than 10s in case it's stuck for some reason
+        // Wait for the tasks already queued to be processed, but not more than DISPOSE_TIMEOUT in case the processing
+        // is stuck for some reason
+        long deadline = System.nanoTime() + DISPOSE_TIMEOUT;
         try {
-            this.thread.join(10000);
+            // Make sure to wake up the thread if it's waiting for a new task
+            if (this.queue.offer(EventStoreTask.STOP, DISPOSE_TIMEOUT, TimeUnit.NANOSECONDS)) {
+                long remaining = TimeUnit.NANOSECONDS.toMillis(deadline - System.nanoTime());
+                if (remaining > 0) {
+                    this.thread.join(remaining);
+                }
+            }
         } catch (InterruptedException e) {
-            this.logger.warn("The thread handling asynchronous storage for event store [{}] has been interrupted",
-                this.descriptor.getRoleHint(), e);
+            this.logger.warn("Interrupted while waiting for the event store [{}] to process its queued tasks: [{}]",
+                this.descriptor.getRoleHint(), ExceptionUtils.getRootCauseMessage(e));
 
             this.thread.interrupt();
+            Thread.currentThread().interrupt();
         }
+
+        if (this.thread.isAlive()) {
+            this.logger.warn("The thread handling asynchronous storage for event store [{}] did not finish processing"
+                + " the queued tasks in [{}] seconds", this.descriptor.getRoleHint(),
+                TimeUnit.NANOSECONDS.toSeconds(DISPOSE_TIMEOUT));
+        }
+
+        failPendingTasks();
+    }
+
+    /**
+     * Fail the tasks which are still in the queue (because the processing thread did not reach them in time or because
+     * they were added while the store was being disposed) so that nobody waits for them forever.
+     */
+    private void failPendingTasks()
+    {
+        List<EventStoreTask<?, ?>> pendingTasks = new ArrayList<>();
+        this.queue.drainTo(pendingTasks);
+        pendingTasks.removeIf(task -> task == EventStoreTask.STOP);
+
+        if (!pendingTasks.isEmpty()) {
+            this.logger.warn("[{}] tasks were not processed before the event store [{}] was disposed",
+                pendingTasks.size(), this.descriptor.getRoleHint());
+
+            for (EventStoreTask<?, ?> task : pendingTasks) {
+                task.future.completeExceptionally(new EventStreamException(getDisposedMessage()));
+            }
+        }
+    }
+
+    private String getDisposedMessage()
+    {
+        return String.format("The event store [%s] is disposed", this.descriptor.getRoleHint());
     }
 }

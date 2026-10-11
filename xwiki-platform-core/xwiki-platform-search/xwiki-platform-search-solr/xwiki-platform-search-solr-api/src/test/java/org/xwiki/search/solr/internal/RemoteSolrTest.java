@@ -19,9 +19,15 @@
  */
 package org.xwiki.search.solr.internal;
 
+import java.util.ArrayList;
+import java.util.List;
+
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
+import org.xwiki.component.descriptor.DefaultComponentDependency;
+import org.xwiki.component.descriptor.DefaultComponentDescriptor;
 import org.xwiki.component.manager.ComponentLookupException;
+import org.xwiki.component.phase.Disposable;
 import org.xwiki.search.solr.Solr;
 import org.xwiki.search.solr.internal.api.SolrConfiguration;
 import org.xwiki.test.LogLevel;
@@ -105,5 +111,39 @@ class RemoteSolrTest
         RemoteSolr solr = this.componentManager.getInstance(Solr.class, RemoteSolr.TYPE);
 
         assertEquals("http://baseurl", solr.getRootClient().getBaseURL());
+    }
+
+    @Test
+    void disposeAfterDefaultPriorityComponents() throws Exception
+    {
+        List<String> disposed = new ArrayList<>();
+
+        // Components with the default dispose priority, like the event store, may still need Solr while disposed
+        Disposable solrUser = () -> disposed.add("user");
+        this.componentManager.registerComponent(Disposable.class, "user", solrUser);
+
+        // The DisposePriority annotation is inherited, so it applies to this subclass of RemoteSolr
+        Solr solr = new RemoteSolr()
+        {
+            @Override
+            public void dispose()
+            {
+                disposed.add("solr");
+            }
+        };
+        // Declare that Solr depends on the other component: with the same dispose priority, Solr would be disposed
+        // first, since a component is disposed before its dependencies
+        DefaultComponentDescriptor<Solr> descriptor = new DefaultComponentDescriptor<>();
+        descriptor.setRoleType(Solr.class);
+        descriptor.setRoleHint("test");
+        DefaultComponentDependency<Disposable> dependency = new DefaultComponentDependency<>();
+        dependency.setRoleType(Disposable.class);
+        dependency.setRoleHint("user");
+        descriptor.addComponentDependency(dependency);
+        this.componentManager.registerComponent(descriptor, solr);
+
+        this.componentManager.dispose();
+
+        assertEquals(List.of("user", "solr"), disposed);
     }
 }
