@@ -567,6 +567,23 @@ rendering.transformations = $xwikiRenderingTransformations
 #-# The default is 50.
 # job.statusCacheSize = 50
 
+#-# [Since 18.9.0RC1]
+#-# The number of seconds during which the status of a job stored by another cluster member, or the fact that no other
+#-# member stored one, is kept in cache (see job.statusRemoteLookup). It is the maximum delay before a member sees a
+#-# status stored by another member. 0 disables this cache: every request for such a status reads the database.
+#-# The default is 10.
+# job.statusRemoteCacheLifespan = 10
+
+#-# [Since 18.9.0RC1]
+#-# Whether a cluster member asked for the status of a job it does not know (for example a job executed by another
+#-# member) looks for the most recent status stored by the other cluster members. It is only used when remote
+#-# observation is enabled, and it needs a blob store shared by all the members (see store.blobStoreType).
+#-# A member stores the status of a job when the job ends: while a job runs on another member, its status is not
+#-# visible, or the status of its previous run is returned (without its log) when the same job was executed before.
+#-# The Distribution Wizard jobs are excluded: each member uses its own status for them.
+#-# The default is true.
+# job.statusRemoteLookup = true
+
 #-# [Since 12.5RC1]
 #-# The maximum number of entries to put in cache for the GroupedJobInitializer components.
 #-# The default is 100.

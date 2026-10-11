@@ -29,6 +29,9 @@ import javax.inject.Named;
 
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentMatchers;
+import org.slf4j.Logger;
+import org.xwiki.component.util.ReflectionUtils;
+import org.xwiki.configuration.ConfigurationSource;
 import org.xwiki.job.DefaultJobStatus;
 import org.xwiki.job.DefaultRequest;
 import org.xwiki.job.event.status.JobStatus;
@@ -45,8 +48,10 @@ import org.xwiki.store.blob.FileSystemBlobStoreProperties;
 import org.xwiki.store.blob.internal.FileSystemBlobStore;
 import org.xwiki.test.annotation.ComponentList;
 import org.xwiki.test.junit5.mockito.ComponentTest;
+import org.xwiki.test.junit5.mockito.InjectComponentManager;
 import org.xwiki.test.junit5.mockito.InjectMockComponents;
 import org.xwiki.test.junit5.mockito.MockComponent;
+import org.xwiki.test.mockito.MockitoComponentManager;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
@@ -54,6 +59,8 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
@@ -76,6 +83,14 @@ class DatabaseJobStatusStoreTest extends AbstractJobStatusHibernateTest
 {
     private static final String NODE_ID = "node-job-store";
 
+    private static final String OTHER_NODE_ID = "node-other";
+
+    private static final String THIRD_NODE_ID = "node-third";
+
+    private static final String REMOTE_LOOKUP_PROPERTY = "job.statusRemoteLookup";
+
+    private static final List<String> REMOTE_ID = List.of("jobs", "remote", "status");
+
     @InjectMockComponents
     private DatabaseJobStatusStore store;
 
@@ -93,10 +108,19 @@ class DatabaseJobStatusStoreTest extends AbstractJobStatusHibernateTest
     @Named("version3")
     private JobStatusFolderResolver folderResolver;
 
+    @MockComponent
+    @Named("xwikiproperties")
+    private ConfigurationSource configuration;
+
+    @InjectComponentManager
+    private MockitoComponentManager componentManager;
+
     @Override
     protected void configureAdditionalComponents() throws Exception
     {
         when(this.remoteObservationManagerConfiguration.getId()).thenReturn(NODE_ID);
+        when(this.remoteObservationManagerConfiguration.isEnabled()).thenReturn(true);
+        when(this.configuration.getProperty(REMOTE_LOOKUP_PROPERTY, true)).thenReturn(true);
         when(this.filesystemStore.loadJobStatus(ArgumentMatchers.anyList())).thenReturn(null);
         when(this.folderResolver.getFolderSegments(ArgumentMatchers.anyList()))
             .thenAnswer(invocation -> invocation.getArgument(0));
@@ -281,5 +305,200 @@ class DatabaseJobStatusStoreTest extends AbstractJobStatusHibernateTest
         assertInstanceOf(DatabaseLoggerTail.class, loggerTail);
 
         verify(this.filesystemStore).removeJobStatus(id);
+    }
+
+    @Test
+    void loadRemoteJobStatusReturnsTheMostRecentStatusOfTheOtherMembers() throws Exception
+    {
+        saveAs(OTHER_NODE_ID, createStatus("other-type", 1000L, 2000L, 3));
+        saveAs(THIRD_NODE_ID, createStatus("third-type", 3000L, 4000L, 2));
+
+        // The current member never executed the job.
+        setNodeId(NODE_ID);
+        assertNull(this.store.loadJobStatus(REMOTE_ID));
+
+        JobStatus remoteStatus = this.store.loadRemoteJobStatus(REMOTE_ID);
+        assertEquals("third-type", remoteStatus.getJobType());
+        assertEquals(JobStatus.State.FINISHED, remoteStatus.getState());
+        // The log is the one stored by the member that executed the job, read from the database.
+        LoggerTail loggerTail = ((DefaultJobStatus<?>) remoteStatus).getLoggerTail();
+        assertInstanceOf(DatabaseLoggerTail.class, loggerTail);
+        assertEquals(2, loggerTail.size());
+        assertEquals("third-type-message-1", loggerTail.getLastLogEvent(LogLevel.INFO).getFormattedMessage());
+
+        // Another member runs the job again: the next read returns the new status, nothing was cached.
+        saveAs(OTHER_NODE_ID, createStatus("other-type-again", 5000L, 6000L, 1));
+        setNodeId(NODE_ID);
+        assertEquals("other-type-again", this.store.loadRemoteJobStatus(REMOTE_ID).getJobType());
+
+        // A member never reads its own status as a remote one.
+        setNodeId(OTHER_NODE_ID);
+        assertEquals("third-type", this.store.loadRemoteJobStatus(REMOTE_ID).getJobType());
+
+        // A status removed by its member is not visible to the others anymore.
+        this.store.removeJobStatus(REMOTE_ID);
+        setNodeId(NODE_ID);
+        assertEquals("third-type", this.store.loadRemoteJobStatus(REMOTE_ID).getJobType());
+
+        // The statuses of the other members are never returned as the status of the current member.
+        assertNull(this.store.loadJobStatus(REMOTE_ID));
+    }
+
+    @Test
+    void loadRemoteJobStatusPrefersAnEndedStatusOverAnOlderOrUndatedOne() throws Exception
+    {
+        saveAs(OTHER_NODE_ID, createStatus("undated-type", null, null, 0));
+        saveAs(THIRD_NODE_ID, createStatus("started-type", 3000L, null, 0));
+        setNodeId(NODE_ID);
+
+        assertEquals("started-type", this.store.loadRemoteJobStatus(REMOTE_ID).getJobType());
+
+        saveAs(OTHER_NODE_ID, createStatus("ended-type", 1000L, 4000L, 0));
+        setNodeId(NODE_ID);
+
+        assertEquals("ended-type", this.store.loadRemoteJobStatus(REMOTE_ID).getJobType());
+    }
+
+    @Test
+    void loadRemoteJobStatusSkipsUnreadableBlobs() throws Exception
+    {
+        saveAs(OTHER_NODE_ID, createStatus("other-type", 1000L, 2000L, 0));
+        saveAs(THIRD_NODE_ID, createStatus("third-type", 3000L, 4000L, 0));
+        setNodeId(NODE_ID);
+
+        // The blob of the most recent status is not readable by the current member (for example a blob store that is
+        // not shared between the members).
+        JobStatusBlobStore blobStore = this.componentManager.getInstance(JobStatusBlobStore.class);
+        blobStore.delete("/" + THIRD_NODE_ID + "/jobs/remote/status/status.xml.zip");
+        Logger logger = mock();
+        ReflectionUtils.setFieldValue(this.store, "logger", logger);
+
+        assertEquals("other-type", this.store.loadRemoteJobStatus(REMOTE_ID).getJobType());
+        verify(logger).debug(eq("Failed to load the job status [{}] stored by the cluster member [{}]: [{}]"),
+            eq("jobs/remote/status"), eq(THIRD_NODE_ID), anyString());
+
+        blobStore.delete("/" + OTHER_NODE_ID + "/jobs/remote/status/status.xml.zip");
+
+        assertNull(this.store.loadRemoteJobStatus(REMOTE_ID));
+    }
+
+    @Test
+    void loadRemoteJobStatusWhenDisabled() throws Exception
+    {
+        saveAs(OTHER_NODE_ID, createStatus("other-type", 1000L, 2000L, 0));
+        setNodeId(NODE_ID);
+        assertNotNull(this.store.loadRemoteJobStatus(REMOTE_ID));
+
+        when(this.configuration.getProperty(REMOTE_LOOKUP_PROPERTY, true)).thenReturn(false);
+        assertNull(this.store.loadRemoteJobStatus(REMOTE_ID));
+
+        // A member without remote observation is not part of a cluster.
+        when(this.configuration.getProperty(REMOTE_LOOKUP_PROPERTY, true)).thenReturn(true);
+        when(this.remoteObservationManagerConfiguration.isEnabled()).thenReturn(false);
+        assertNull(this.store.loadRemoteJobStatus(REMOTE_ID));
+
+        assertNull(this.store.loadRemoteJobStatus(null));
+    }
+
+    @Test
+    void loadRemoteJobStatusWhileTheOwnerRunsTheJobAgain() throws Exception
+    {
+        saveAs(OTHER_NODE_ID, createStatus("previous-run", 1000L, 2000L, 3));
+        setNodeId(NODE_ID);
+        assertEquals(3, ((DefaultJobStatus<?>) this.store.loadRemoteJobStatus(REMOTE_ID)).getLoggerTail().size());
+
+        // The owner starts the same job again: its log rows are replaced while the summary and the blob still
+        // describe the previous run.
+        setNodeId(OTHER_NODE_ID);
+        LoggerTail newRunTail = this.store.createLoggerTail(REMOTE_ID, false);
+
+        setNodeId(NODE_ID);
+        DefaultJobStatus<?> remoteStatus = (DefaultJobStatus<?>) this.store.loadRemoteJobStatus(REMOTE_ID);
+        assertEquals("previous-run", remoteStatus.getJobType());
+        assertEquals(0, remoteStatus.getLoggerTail().size());
+
+        setNodeId(OTHER_NODE_ID);
+        newRunTail.log(new LogEvent(LogLevel.INFO, "new-run-line", null, null));
+
+        // The log of the new run is never shown with the status of the previous run.
+        setNodeId(NODE_ID);
+        remoteStatus = (DefaultJobStatus<?>) this.store.loadRemoteJobStatus(REMOTE_ID);
+        assertEquals(JobStatus.State.FINISHED, remoteStatus.getState());
+        assertEquals("previous-run", remoteStatus.getJobType());
+        assertInstanceOf(LogQueue.class, remoteStatus.getLoggerTail());
+        assertEquals(0, remoteStatus.getLoggerTail().size());
+    }
+
+    @Test
+    void loadRemoteJobStatusWithTheSameDatesOnTwoMembers() throws Exception
+    {
+        saveAs(THIRD_NODE_ID, createStatus("third-type", 1000L, 2000L, 0));
+        saveAs(OTHER_NODE_ID, createStatus("other-type", 1000L, 2000L, 0));
+        setNodeId(NODE_ID);
+
+        // On a tie, the member ids decide.
+        assertEquals("other-type", this.store.loadRemoteJobStatus(REMOTE_ID).getJobType());
+    }
+
+    @Test
+    void loadRemoteJobStatusOfDistributionJobs() throws Exception
+    {
+        List<String> farmId = List.of("distribution");
+        List<String> wikiId = List.of("distribution", "wiki", "subwiki");
+        saveAs(OTHER_NODE_ID, createStatus(farmId, "distribution", 1000L, 2000L, 0));
+        saveAs(OTHER_NODE_ID, createStatus(wikiId, "distribution", 1000L, 2000L, 0));
+        setNodeId(NODE_ID);
+
+        assertNull(this.store.loadRemoteJobStatus(farmId));
+        assertNull(this.store.loadRemoteJobStatus(wikiId));
+        assertNull(this.store.loadRemoteJobStatus(List.of()));
+    }
+
+    @Test
+    void loadRemoteJobStatusOfAnotherIdWithTheSameKey() throws Exception
+    {
+        // ["jobs", "remote/status"] and ["jobs", "remote", "status"] have the same database key.
+        saveAs(OTHER_NODE_ID, createStatus(List.of("jobs", "remote/status"), "other-id", 1000L, 2000L, 0));
+        setNodeId(NODE_ID);
+
+        assertNull(this.store.loadRemoteJobStatus(REMOTE_ID));
+    }
+
+    private void setNodeId(String nodeId)
+    {
+        when(this.remoteObservationManagerConfiguration.getId()).thenReturn(nodeId);
+    }
+
+    private void saveAs(String nodeId, JobStatus status) throws Exception
+    {
+        setNodeId(nodeId);
+        this.store.saveJobStatus(status);
+    }
+
+    private DefaultJobStatus<DefaultRequest> createStatus(String type, Long startDate, Long endDate, int logCount)
+    {
+        return createStatus(REMOTE_ID, type, startDate, endDate, logCount);
+    }
+
+    private DefaultJobStatus<DefaultRequest> createStatus(List<String> id, String type, Long startDate, Long endDate,
+        int logCount)
+    {
+        DefaultRequest request = new DefaultRequest();
+        request.setId(id);
+
+        DefaultJobStatus<DefaultRequest> status = new DefaultJobStatus<>(type, request, null, mock(), mock());
+        status.setState(JobStatus.State.FINISHED);
+        status.setStartDate(startDate != null ? new Date(startDate) : null);
+        status.setEndDate(endDate != null ? new Date(endDate) : null);
+
+        LogQueue logs = new LogQueue();
+        for (int i = 0; i < logCount; ++i) {
+            // The log of a run is written between its start and its end.
+            logs.log(new LogEvent(null, LogLevel.INFO, type + "-message-" + i, null, null,
+                startDate != null ? startDate : 0L));
+        }
+        status.setLoggerTail(logs);
+
+        return status;
     }
 }
