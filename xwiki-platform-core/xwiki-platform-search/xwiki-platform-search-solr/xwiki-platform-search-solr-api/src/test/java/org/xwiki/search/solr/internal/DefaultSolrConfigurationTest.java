@@ -86,6 +86,17 @@ class DefaultSolrConfigurationTest
     }
 
     @Test
+    void getIndexerShutdownTimeout()
+    {
+        assertEquals(5000L, DefaultSolrConfiguration.SOLR_INDEXER_SHUTDOWN_TIMEOUT_DEFAULT);
+
+        when(this.source.getProperty(DefaultSolrConfiguration.SOLR_INDEXER_SHUTDOWN_TIMEOUT_PROPERTY,
+            DefaultSolrConfiguration.SOLR_INDEXER_SHUTDOWN_TIMEOUT_DEFAULT)).thenReturn(42L);
+
+        assertEquals(42L, this.configuration.getIndexerShutdownTimeout());
+    }
+
+    @Test
     void synchronizeAtStartup()
     {
         when(this.source.getProperty(DefaultSolrConfiguration.SOLR_SYNCHRONIZE_AT_STARTUP,
