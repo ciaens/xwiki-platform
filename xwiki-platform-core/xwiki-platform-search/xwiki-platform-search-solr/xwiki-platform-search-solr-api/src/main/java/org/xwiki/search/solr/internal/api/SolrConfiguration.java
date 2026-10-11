@@ -99,6 +99,16 @@ public interface SolrConfiguration
     int getIndexerQueueCapacity();
 
     /**
+     * When XWiki stops, the indexer processes the entries which are still in its queues before stopping, but not
+     * longer than this timeout. The entries which could not be processed in time are dropped (and logged).
+     *
+     * @return the maximum time in milliseconds to wait for the indexer to process its queues when XWiki stops, for
+     *         example {@code 30000}; {@code 0} drops the queued entries immediately
+     * @since 18.9.0RC1
+     */
+    long getIndexerShutdownTimeout();
+
+    /**
      * @return true if a full synchronization job between the database and SOLR index should be run when XWiki starts
      * @since 6.1M2
      */

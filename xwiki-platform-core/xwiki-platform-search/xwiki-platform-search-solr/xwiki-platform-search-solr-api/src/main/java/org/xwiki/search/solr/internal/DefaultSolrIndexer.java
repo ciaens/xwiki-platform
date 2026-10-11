@@ -28,13 +28,18 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.ReadWriteLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 import javax.inject.Inject;
 import javax.inject.Provider;
 import javax.inject.Singleton;
 
+import org.apache.commons.lang3.exception.ExceptionUtils;
 import org.apache.solr.common.SolrInputDocument;
 import org.slf4j.Logger;
 import org.xwiki.bridge.internal.DocumentContextExecutor;
@@ -84,9 +89,9 @@ import com.xpn.xwiki.util.AbstractXWikiRunnable;
  */
 @Component
 @Singleton
-// We start the disposal a bit earlier because we want the resolver & indexer threads to finish before the Solr client
-// is shutdown. We can't stop the threads immediately because the resolve & index queues may have entries that are being
-// processed.
+// We start the disposal earlier than the components with the default priority because the resolve & index threads
+// process the entries which are still queued when the indexer is disposed, and they need the components used to resolve
+// and extract the entities (document store, caches, metadata extractors) and the Solr client to still be available.
 @DisposePriority(500)
 public class DefaultSolrIndexer implements SolrIndexer, Initializable, Disposable, Runnable
 {
@@ -231,9 +236,13 @@ public class DefaultSolrIndexer implements SolrIndexer, Initializable, Disposabl
             while (!Thread.interrupted()) {
                 ResolveQueueEntry queueEntry = getQueueEntry();
 
-                if (queueEntry == RESOLVE_QUEUE_ENTRY_STOP) {
-                    // Stop the index thread: clear the queue and send the stop signal without blocking.
-                    stopIndexerThread();
+                // Stop at the stop signal, or as soon as the indexer stopped waiting for the queued entries.
+                if (queueEntry == RESOLVE_QUEUE_ENTRY_STOP || DefaultSolrIndexer.this.drainAbandoned) {
+                    if (queueEntry != RESOLVE_QUEUE_ENTRY_STOP) {
+                        dropResolveQueueEntry(queueEntry);
+                    }
+                    // Stop the index thread once it has processed the index operations queued before.
+                    sendIndexerStopSignal();
                     break;
                 }
 
@@ -266,6 +275,10 @@ public class DefaultSolrIndexer implements SolrIndexer, Initializable, Disposabl
                     Iterable<EntityReference> references = retrieveReferences(queueEntry);
 
                     for (EntityReference reference : references) {
+                        if (DefaultSolrIndexer.this.drainAbandoned) {
+                            // The indexer stopped waiting for the queued entries.
+                            break;
+                        }
                         indexQueue.put(new IndexQueueEntry(
                             DefaultSolrIndexer.this.entityReferenceFactory.getReference(reference),
                             queueEntry.operation));
@@ -319,6 +332,13 @@ public class DefaultSolrIndexer implements SolrIndexer, Initializable, Disposabl
      */
     private static final IndexQueueEntry INDEX_QUEUE_ENTRY_STOP =
         new IndexQueueEntry((String) null, IndexOperation.STOP);
+
+    private static final String INDEXING_STOPPED = "Indexing stopped.";
+
+    private static final String INDEXER_DISPOSED = "The indexer has been disposed";
+
+    private static final String STOPPED_INDEXER_LOG =
+        "The Solr indexer is stopped, ignoring operation [{}] on reference [{}]";
 
     /**
      * Logging framework.
@@ -426,9 +446,27 @@ public class DefaultSolrIndexer implements SolrIndexer, Initializable, Disposabl
     private final AtomicInteger pendingResolveItems = new AtomicInteger();
 
     /**
-     * Indicate of the component has been disposed.
+     * Indicate if the component has been disposed, in which case no new entry is accepted.
      */
-    private boolean disposed;
+    private volatile boolean disposed;
+
+    /**
+     * Indicate if the processing of the queued entries has been abandoned because it did not finish in time when the
+     * component was disposed.
+     */
+    private volatile boolean drainAbandoned;
+
+    /**
+     * Makes "check that the indexer is not disposed and queue an entry" atomic with respect to "mark the indexer as
+     * disposed and queue the stop signal", so that no entry can be queued behind the stop signal. The resolve queue is
+     * not bounded, so a producer never waits while holding the read lock.
+     */
+    private final ReadWriteLock disposeLock = new ReentrantReadWriteLock();
+
+    /**
+     * The number of requests to the Solr server which failed after the indexer was disposed.
+     */
+    private final AtomicInteger failedRequestsAfterDispose = new AtomicInteger();
 
     /**
      * The size of the not yet sent batch.
@@ -479,35 +517,151 @@ public class DefaultSolrIndexer implements SolrIndexer, Initializable, Disposabl
     @Override
     public void dispose() throws ComponentLifecycleException
     {
-        // Mark the component as disposed
-        this.disposed = true;
+        // Stop accepting new entries, and ask the resolve thread to stop once it has processed the entries queued
+        // before, which then asks the index thread to stop once it has processed (and committed) the index operations
+        // queued before. The resolve queue is not bounded so the stop signal is always accepted.
+        this.disposeLock.writeLock().lock();
+        try {
+            if (this.disposed) {
+                // Already disposed.
+                return;
+            }
+            this.disposed = true;
+            this.resolveQueue.offer(RESOLVE_QUEUE_ENTRY_STOP);
+        } finally {
+            this.disposeLock.writeLock().unlock();
+        }
 
-        // Stop the resolve thread. Clear the queue and send the stop signal without blocking. We know that the resolve
-        // queue will remain empty after the clear call because we set the disposed flag above.
+        // Wait for the queued entries to be processed while the document store and the Solr client are still available
+        // (the indexer is disposed before them), but not more than the configured timeout in case Solr cannot be
+        // reached or the processing is stuck for some other reason.
+        long timeout = Math.max(this.configuration.getIndexerShutdownTimeout(), 0);
+        boolean stopped;
+        try {
+            stopped = waitForThreads(System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeout));
+        } catch (InterruptedException e) {
+            this.logger.warn("Interrupted while waiting for the Solr indexer to process its queues: [{}]",
+                ExceptionUtils.getRootCauseMessage(e));
+            Thread.currentThread().interrupt();
+            stopped = false;
+        }
+
+        if (!stopped) {
+            abandonDrain(timeout);
+        } else if (this.failedRequestsAfterDispose.get() > 0) {
+            // The queues were processed in time, but some changes could not be sent (the Solr server refused the
+            // connection for example): each failure was logged as an error.
+            this.logger.warn("[{}] requests to the Solr server failed while the Solr indexer was processing its queues"
+                + " before stopping. The Solr index may miss the corresponding changes.",
+                this.failedRequestsAfterDispose.get());
+        }
+    }
+
+    /**
+     * Wait for the resolve and index threads to stop and for the Solr client operations they submitted to finish.
+     *
+     * @param deadline the {@link System#nanoTime()} value after which to stop waiting
+     * @return {@code true} if everything stopped before the deadline
+     * @throws InterruptedException if the current thread is interrupted while waiting
+     */
+    private boolean waitForThreads(long deadline) throws InterruptedException
+    {
+        for (Thread thread : List.of(this.resolveThread, this.indexThread)) {
+            long remaining = deadline - System.nanoTime();
+            if (remaining > 0) {
+                TimeUnit.NANOSECONDS.timedJoin(thread, remaining);
+            }
+            if (thread.isAlive()) {
+                return false;
+            }
+        }
+
+        // The index thread shuts down the Solr client executor when it stops, after submitting its last commit.
+        return this.solrClientExecutor.awaitTermination(Math.max(deadline - System.nanoTime(), 0),
+            TimeUnit.NANOSECONDS);
+    }
+
+    /**
+     * Stop processing the queued entries: drop what is left in the queues and log how much was lost.
+     *
+     * @param timeout the time in milliseconds which was given to the processing of the queued entries
+     */
+    private void abandonDrain(long timeout)
+    {
+        // Make the resolve and index threads stop as soon as possible: they don't take new entries and don't send
+        // anything more to the Solr server. They are not interrupted, so the operation in progress (a database query,
+        // the extraction of a document or a request to the Solr server) is finished first.
+        this.drainAbandoned = true;
+        // The operations already submitted to the Solr client are still executed.
+        this.solrClientExecutor.shutdown();
+
+        // Clear the resolve queue and send the stop signal again in case the resolve thread did not reach it yet
+        // (if it did, the second stop signal is never read).
+        int resolveEntries = 0;
         for (ResolveQueueEntry entry = this.resolveQueue.poll(); entry != null; entry = this.resolveQueue.poll()) {
-            if (entry.operation == IndexOperation.READY_MARKER && entry.readyIndicator != null) {
-                entry.readyIndicator.completeExceptionally(new StoreStoppedException("Indexing stopped."));
-            } else if (entry.operation != IndexOperation.READY_MARKER) {
-                this.pendingResolveItems.decrementAndGet();
+            if (entry != RESOLVE_QUEUE_ENTRY_STOP) {
+                dropResolveQueueEntry(entry);
+                if (entry.operation != IndexOperation.READY_MARKER) {
+                    resolveEntries++;
+                }
             }
         }
         this.resolveQueue.offer(RESOLVE_QUEUE_ENTRY_STOP);
 
-        // Stop the index thread. Clear the queue and send the stop signal without blocking. There should be enough
-        // space in the index queue before the special stop entry is added as long the the index queue capacity is
-        // greater than 1. In the worse case, the clear call will unblock the resolve thread (which was waiting because
-        // the index queue was full) and just one entry will be added to the queue before the special stop entry.
-        stopIndexerThread();
+        // Same for the index queue. Clearing it also unblocks the resolve thread if it was waiting for some space in
+        // the index queue.
+        int indexEntries = clearIndexQueue() + this.batchSize;
+        this.indexQueue.offer(INDEX_QUEUE_ENTRY_STOP);
+
+        int sendingEntries = this.committingBatchSize;
+        if (timeout > 0 || resolveEntries > 0 || indexEntries > 0 || sendingEntries > 0) {
+            this.logger.warn("The Solr indexer could not finish processing its queues within [{}] ms while stopping:"
+                + " [{}] references to resolve and [{}] index operations were dropped (not counting the entity being"
+                + " indexed, if any) and [{}] index operations were still being sent to the Solr server. The Solr index"
+                + " may miss the corresponding changes.", timeout, resolveEntries, indexEntries, sendingEntries);
+        }
     }
 
-    private void stopIndexerThread()
+    private void dropResolveQueueEntry(ResolveQueueEntry entry)
     {
+        if (entry.operation == IndexOperation.READY_MARKER) {
+            entry.readyIndicator.completeExceptionally(new StoreStoppedException(INDEXING_STOPPED));
+        } else {
+            this.pendingResolveItems.decrementAndGet();
+        }
+    }
+
+    private int clearIndexQueue()
+    {
+        int count = 0;
         for (IndexQueueEntry entry = this.indexQueue.poll(); entry != null; entry = this.indexQueue.poll()) {
-            if (entry.operation == IndexOperation.READY_MARKER && entry.readyIndicator != null) {
-                entry.readyIndicator.completeExceptionally(new StoreStoppedException("Indexing stopped."));
+            if (entry.operation == IndexOperation.READY_MARKER) {
+                entry.readyIndicator.completeExceptionally(new StoreStoppedException(INDEXING_STOPPED));
+            } else if (entry != INDEX_QUEUE_ENTRY_STOP) {
+                count++;
             }
         }
-        this.indexQueue.offer(INDEX_QUEUE_ENTRY_STOP);
+        return count;
+    }
+
+    private void sendIndexerStopSignal()
+    {
+        if (this.drainAbandoned) {
+            // Don't wait for some space in the index queue: the index thread is stopping anyway.
+            this.indexQueue.offer(INDEX_QUEUE_ENTRY_STOP);
+            return;
+        }
+
+        try {
+            // Wait for some space in the index queue if it's full: the index thread is processing it, or the queue is
+            // cleared when the processing takes too long.
+            this.indexQueue.put(INDEX_QUEUE_ENTRY_STOP);
+        } catch (InterruptedException e) {
+            // Don't wait: drop the index operations which are still queued to make space for the stop signal.
+            clearIndexQueue();
+            this.indexQueue.offer(INDEX_QUEUE_ENTRY_STOP);
+            Thread.currentThread().interrupt();
+        }
     }
 
     @Override
@@ -550,11 +704,19 @@ public class DefaultSolrIndexer implements SolrIndexer, Initializable, Disposabl
         for (IndexQueueEntry batchEntry = queueEntry; batchEntry != null; batchEntry = this.indexQueue.poll()) {
             this.indexQueueRemovalCounter.incrementAndGet();
 
-            if (batchEntry == INDEX_QUEUE_ENTRY_STOP) {
+            // Stop at the stop signal, or as soon as the indexer stopped waiting for the queued entries.
+            if (batchEntry == INDEX_QUEUE_ENTRY_STOP || this.drainAbandoned) {
+                if (batchEntry.operation == IndexOperation.READY_MARKER) {
+                    batchEntry.readyIndicator.completeExceptionally(new StoreStoppedException(INDEXING_STOPPED));
+                }
+                // Send and commit what's left of the batch, unless the indexer stopped waiting for it.
+                if (this.batchSize > 0) {
+                    commit(solrDocuments);
+                }
                 // Handle the shutdown of the executor here to avoid that the executor is shut down before the batch
-                // processing finished.
+                // processing finished. The operations already submitted to the executor are still executed.
                 this.solrClientExecutor.shutdown();
-                // Discard the current batch and stop the indexing thread.
+                // Stop the indexing thread.
                 return false;
             }
 
@@ -586,7 +748,10 @@ public class DefaultSolrIndexer implements SolrIndexer, Initializable, Disposabl
                         // Add the completion of the ready indicator to the same queue to ensure that it is processed
                         // after the commit.
                         IndexQueueEntry finalBatchEntry = batchEntry;
-                        this.solrClientExecutor.execute(() -> finalBatchEntry.readyIndicator.complete(null));
+                        if (!execute(() -> finalBatchEntry.readyIndicator.complete(null))) {
+                            finalBatchEntry.readyIndicator
+                                .completeExceptionally(new StoreStoppedException(INDEXING_STOPPED));
+                        }
                         break;
                     default:
                         // Do nothing.
@@ -615,7 +780,7 @@ public class DefaultSolrIndexer implements SolrIndexer, Initializable, Disposabl
     private void applyDeletion(IndexQueueEntry queueEntry) throws SolrIndexerException
     {
         String id = queueEntry.reference == null ? null : this.solrRefereceResolver.getId(queueEntry.reference);
-        this.solrClientExecutor.execute(() -> {
+        execute(() -> {
             try {
                 if (id == null) {
                     this.solrInstance.deleteByQuery(queueEntry.deleteQuery);
@@ -623,6 +788,7 @@ public class DefaultSolrIndexer implements SolrIndexer, Initializable, Disposabl
                     this.solrInstance.delete(id);
                 }
             } catch (Exception e) {
+                onRequestFailure();
                 this.logger.error("Failed to delete document [{}] from the Solr server", queueEntry, e);
             }
         });
@@ -640,10 +806,11 @@ public class DefaultSolrIndexer implements SolrIndexer, Initializable, Disposabl
             // Copy the documents to flush to a new list so that we can clear the original list without affecting the
             // documents that are being added to the Solr server.
             List<SolrInputDocument> documentsToFlush = new ArrayList<>(documents);
-            this.solrClientExecutor.execute(() -> {
+            execute(() -> {
                 try {
                     this.solrInstance.add(documentsToFlush);
                 } catch (Exception e) {
+                    onRequestFailure();
                     this.logger.error("Failed to add documents to the Solr server", e);
                 }
             });
@@ -659,6 +826,15 @@ public class DefaultSolrIndexer implements SolrIndexer, Initializable, Disposabl
      */
     private void commit(List<SolrInputDocument> documents)
     {
+        if (this.drainAbandoned) {
+            // The indexer stopped waiting for the queued entries: don't send anything more to the Solr server.
+            documents.clear();
+            this.batchSize = 0;
+            this.batchLength = 0;
+
+            return;
+        }
+
         flushDocuments(documents);
         if (this.commitFuture != null) {
             try {
@@ -671,26 +847,63 @@ public class DefaultSolrIndexer implements SolrIndexer, Initializable, Disposabl
         // At this point, we can be sure that there is no more commit in the queue - so we can safely store the size
         // of the next commit.
         this.committingBatchSize = this.batchSize;
-        this.commitFuture = this.solrClientExecutor.submit(() -> {
-            try {
-                this.solrInstance.commit();
-            } catch (Exception e) {
-                this.logger.error("Failed to commit index changes to the Solr server. Rolling back.", e);
-
-                try {
-                    this.solrInstance.rollback();
-                } catch (Exception ex) {
-                    // Just log the failure.
-                    this.logger.error("Failed to rollback index changes.", ex);
-                }
-            }
-
+        try {
+            this.commitFuture = this.solrClientExecutor.submit(this::commitTask);
+        } catch (RejectedExecutionException e) {
+            // The indexer stopped waiting for the queued entries in the meantime.
+            this.commitFuture = null;
             this.committingBatchSize = 0;
-
-            return null;
-        });
+        }
         this.batchSize = 0;
         this.batchLength = 0;
+    }
+
+    private Void commitTask()
+    {
+        try {
+            this.solrInstance.commit();
+        } catch (Exception e) {
+            onRequestFailure();
+            this.logger.error("Failed to commit index changes to the Solr server. Rolling back.", e);
+
+            try {
+                this.solrInstance.rollback();
+            } catch (Exception ex) {
+                // Just log the failure.
+                this.logger.error("Failed to rollback index changes.", ex);
+            }
+        }
+
+        this.committingBatchSize = 0;
+
+        return null;
+    }
+
+    /**
+     * Submit an operation to the Solr client thread.
+     *
+     * @param task the operation to execute
+     * @return {@code false} if the operation was not accepted because the indexer stopped waiting for the queued
+     *         entries
+     */
+    private boolean execute(Runnable task)
+    {
+        try {
+            this.solrClientExecutor.execute(task);
+
+            return true;
+        } catch (RejectedExecutionException e) {
+            this.logger.debug("The Solr indexer is stopped, ignoring a request to the Solr server");
+
+            return false;
+        }
+    }
+
+    private void onRequestFailure()
+    {
+        if (this.disposed) {
+            this.failedRequestsAfterDispose.incrementAndGet();
+        }
     }
 
     /**
@@ -781,18 +994,26 @@ public class DefaultSolrIndexer implements SolrIndexer, Initializable, Disposabl
      */
     private void addToQueue(EntityReference reference, boolean recurse, IndexOperation operation)
     {
-        if (!this.disposed) {
-            // Increment before the put so that getQueueSize() never transiently returns zero while the resolver is
-            // consuming this entry from resolveQueue but has not yet placed resolved references into indexQueue.
-            this.pendingResolveItems.incrementAndGet();
-            // Don't block because the capacity of the resolver queue is not limited.
-            try {
-                this.resolveQueue.put(
-                    new ResolveQueueEntry(this.entityReferenceFactory.getReference(reference), recurse, operation));
-            } catch (InterruptedException e) {
-                this.pendingResolveItems.decrementAndGet();
-                this.logger.error("Failed to add reference [{}] to Solr indexing queue", reference, e);
+        ResolveQueueEntry entry =
+            new ResolveQueueEntry(this.entityReferenceFactory.getReference(reference), recurse, operation);
+
+        // Hold the read lock so that the entry cannot be queued behind the stop signal.
+        this.disposeLock.readLock().lock();
+        try {
+            if (!this.disposed) {
+                // Increment before the put so that getQueueSize() never transiently returns zero while the resolver is
+                // consuming this entry from resolveQueue but has not yet placed resolved references into indexQueue.
+                this.pendingResolveItems.incrementAndGet();
+                // Don't block because the capacity of the resolver queue is not limited.
+                this.resolveQueue.put(entry);
+            } else {
+                this.logger.debug(STOPPED_INDEXER_LOG, operation, reference);
             }
+        } catch (InterruptedException e) {
+            this.pendingResolveItems.decrementAndGet();
+            this.logger.error("Failed to add reference [{}] to Solr indexing queue", reference, e);
+        } finally {
+            this.disposeLock.readLock().unlock();
         }
     }
 
@@ -821,16 +1042,20 @@ public class DefaultSolrIndexer implements SolrIndexer, Initializable, Disposabl
             this.configuration::getIndexerQueueCapacity
         );
 
-        if (!this.disposed) {
-            try {
+        // Hold the read lock so that the marker cannot be queued behind the stop signal.
+        this.disposeLock.readLock().lock();
+        try {
+            if (!this.disposed) {
                 this.resolveQueue.put(new ResolveQueueEntry(readyIndicator));
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                readyIndicator.completeExceptionally(e);
+            } else {
+                // The indexer has been stopped and won't become ready again.
+                readyIndicator.completeExceptionally(new StoreStoppedException(INDEXER_DISPOSED));
             }
-        } else {
-            // The indexer has been stopped and won't become ready again.
-            readyIndicator.completeExceptionally(new StoreStoppedException("The indexer has been disposed"));
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            readyIndicator.completeExceptionally(e);
+        } finally {
+            this.disposeLock.readLock().unlock();
         }
 
         return readyIndicator;
