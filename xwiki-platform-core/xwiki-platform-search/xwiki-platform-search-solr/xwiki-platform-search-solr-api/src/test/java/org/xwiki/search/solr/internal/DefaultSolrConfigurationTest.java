@@ -151,4 +151,13 @@ class DefaultSolrConfigurationTest
 
         assertEquals(42, this.configuration.getSynchronizationBatchSize());
     }
+
+    @Test
+    void getSynchronizeOnSingletonGainDelay()
+    {
+        when(this.source.getProperty(DefaultSolrConfiguration.SOLR_SYNCHRONIZE_ON_SINGLETON_GAIN_DELAY,
+            DefaultSolrConfiguration.SOLR_SYNCHRONIZE_ON_SINGLETON_GAIN_DELAY_DEFAULT)).thenReturn(5);
+
+        assertEquals(5, this.configuration.getSynchronizeOnSingletonGainDelay());
+    }
 }
