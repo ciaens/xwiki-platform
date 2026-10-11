@@ -83,6 +83,11 @@ public abstract class AbstractDataMigrationManager implements DataMigrationManag
     protected Collection<XWikiMigration> migrations;
 
     /**
+     * True while {@link #startMigrations()} is running.
+     */
+    private volatile boolean migrating;
+
+    /**
      * Internal class used to find out the data migration that are being forced in the XWiki configuration file.
      */
     protected class XWikiMigration
@@ -680,11 +685,19 @@ public abstract class AbstractDataMigrationManager implements DataMigrationManag
             return;
         }
 
+        this.migrating = true;
         try {
             startMigrations();
         } finally {
+            this.migrating = false;
             this.migrations = null;
         }
+    }
+
+    @Override
+    public boolean isMigrating()
+    {
+        return this.migrating;
     }
 
     /**
