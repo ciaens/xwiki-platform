@@ -111,8 +111,32 @@ $services.template.execute('logging_macros.vm')
   #end
 #end
 
-#macro (jobFinishedMessage $status $translationPrefix $successKey $errorKey $canceledKey $warningKey)
+## Checks whether a job stopped before its end because its thread was interrupted, which is what happens to the jobs
+## still running or waiting to run when XWiki stops: an InterruptedException or a ClosedByInterruptException is in the
+## cause chain of its error.
+#macro (_isJobInterrupted $status $interrupted)
+  #set ($macro.interrupted = false)
   #if ($status.error)
+    #foreach ($throwable in $exceptiontool.getThrowableList($status.error))
+      #set ($macro.className = $throwable.getClass().getName())
+      #if ($macro.className == 'java.lang.InterruptedException'
+          || $macro.className == 'java.nio.channels.ClosedByInterruptException')
+        #set ($macro.interrupted = true)
+        #break($foreach)
+      #end
+    #end
+  #end
+  #set ($interrupted = $NULL)
+  #setVariable("$interrupted" $macro.interrupted)
+#end
+
+#macro (jobFinishedMessage $status $translationPrefix $successKey $errorKey $canceledKey $warningKey)
+  #_isJobInterrupted($status $interrupted)
+  #if ($interrupted)
+    #set ($messageKeys = ["${translationPrefix}.finish.interrupted", "job.status.${status.jobType}.interrupted",
+      'job.status.interrupted'])
+    #warning($escapetool.xml($services.localization.render($messageKeys)))
+  #elseif ($status.error)
     #set($messageKeys = [$errorKey, "${translationPrefix}.finish.error", "job.status.${status.jobType}.error", 'job.status.error'])
     #error($services.localization.render($messageKeys))
   #elseif ($status.canceled)
@@ -173,7 +197,7 @@ $services.template.execute('logging_macros.vm')
     #if (!$finished)
       #displayJobProgressBar($jobStatus)
     #else
-      #jobFinishedMessage($status, $translationPrefix)
+      #jobFinishedMessage($jobStatus, $translationPrefix)
     #end
     #if ($showLogs || $isAdvancedUser || $isSuperAdmin)
       #displayJobStatusLog($jobStatus true)
