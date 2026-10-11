@@ -24,6 +24,7 @@ import java.util.Locale;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.xwiki.bridge.event.DocumentCreatedEvent;
 import org.xwiki.bridge.event.DocumentDeletedEvent;
@@ -32,6 +33,8 @@ import org.xwiki.mail.GeneralMailConfigurationUpdatedEvent;
 import org.xwiki.model.reference.DocumentReference;
 import org.xwiki.model.reference.EntityReference;
 import org.xwiki.model.reference.WikiReference;
+import org.xwiki.observation.remote.RemoteObservationManagerContext;
+import org.xwiki.search.solr.internal.api.SolrConfiguration;
 import org.xwiki.search.solr.internal.api.SolrIndexer;
 import org.xwiki.test.junit5.mockito.ComponentTest;
 import org.xwiki.test.junit5.mockito.InjectMockComponents;
@@ -44,6 +47,7 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 /**
@@ -59,6 +63,12 @@ class SolrIndexEventListenerTest
 
     @MockComponent
     private SolrIndexer indexer;
+
+    @MockComponent
+    private RemoteObservationManagerContext remoteObservationManagerContext;
+
+    @MockComponent
+    private SolrConfiguration solrConfiguration;
 
     @Test
     void onDocumentDeleted()
@@ -147,5 +157,40 @@ class SolrIndexEventListenerTest
         String otherWiki = "otherwiki";
         this.listener.onEvent(new GeneralMailConfigurationUpdatedEvent(otherWiki), otherWiki, null);
         verify(this.indexer).index(new WikiReference(otherWiki), true);
+    }
+
+    @ParameterizedTest
+    @CsvSource({ "embedded, false", "embedded, true", "remote, false" })
+    void indexLocalEventsAndRemoteEventsWithEmbeddedSolr(String serverType, boolean remoteEvent)
+    {
+        when(this.solrConfiguration.getServerType()).thenReturn(serverType);
+        when(this.remoteObservationManagerContext.isRemoteState()).thenReturn(remoteEvent);
+
+        XWikiDocument translation = mock();
+        DocumentReference translationReference = new DocumentReference("wiki", "Path", "Page", Locale.FRENCH);
+        when(translation.getDocumentReferenceWithLocale()).thenReturn(translationReference);
+
+        this.listener.onEvent(new DocumentUpdatedEvent(), translation, null);
+
+        verify(this.indexer).index(translationReference, false);
+        if (!remoteEvent) {
+            // The configuration is only read for remote events.
+            verifyNoInteractions(this.solrConfiguration);
+        }
+    }
+
+    @Test
+    void ignoreRemoteEventsWithRemoteSolr()
+    {
+        when(this.solrConfiguration.getServerType()).thenReturn("remote");
+        when(this.remoteObservationManagerContext.isRemoteState()).thenReturn(true);
+
+        XWikiDocument document = mock();
+
+        this.listener.onEvent(new DocumentUpdatedEvent(), document, null);
+        this.listener.onEvent(new DocumentDeletedEvent(), document, null);
+        this.listener.onEvent(new GeneralMailConfigurationUpdatedEvent(), null, null);
+
+        verifyNoInteractions(this.indexer, document);
     }
 }
