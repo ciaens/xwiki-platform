@@ -578,6 +578,22 @@ rendering.transformations = $xwikiRenderingTransformations
 #-# The default value is 60000 for 60 000ms.
 # job.groupedJobThreadKeepAliveTime = 60000
 
+#-# [Since 18.9.0RC1]
+#-# The time budget in milliseconds of the running jobs (a page move, an extension upgrade, etc.) when XWiki stops.
+#-# The jobs are given this time minus a reserve (the smallest of 2 seconds and half of this time) to finish. The jobs
+#-# still running then are canceled when they are cancelable (they stop at their next checkpoint) and interrupted
+#-# otherwise, and the reserve lets them save their status (the interruption is kept as the error of the job). The jobs
+#-# still running at the end of this time are interrupted without waiting for them, so this step of the shutdown never
+#-# takes longer than this value. Set it to 0 to interrupt the running jobs right away, without waiting for them.
+#-# The time XWiki is given to stop before its process is killed must cover this value plus the rest of the shutdown:
+#-# * Kubernetes gives 30 seconds by default (terminationGracePeriodSeconds), which leaves room for the default value.
+#-# * Docker gives 10 seconds by default, which can already be too short for a complete stop of XWiki (for example while
+#-#   a mail is being sent). If you run long jobs, raise it (docker stop --time, docker run --stop-timeout,
+#-#   stop_grace_period in Docker Compose) together with this value.
+#-# If the process is killed while XWiki waits for the jobs, the other components are not stopped properly.
+#-# The default value is 5000 for 5 000ms.
+# job.shutdownTimeout = 5000
+
 #-------------------------------------------------------------------------------------
 # Extension Manager
 #-------------------------------------------------------------------------------------
