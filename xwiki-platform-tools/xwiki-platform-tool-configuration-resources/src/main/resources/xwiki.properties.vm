@@ -922,6 +922,16 @@ distribution.automaticStartOnWiki=$xwikiPropertiesAutomaticStartOnWiki
 #-# The default is 10000.
 # solr.indexer.queue.capacity=100000
 
+#-# [Since 18.9.0RC1]
+#-# The maximum time in milliseconds to wait, when XWiki stops, for the indexer to process the elements which are still
+#-# in its queue (the changes saved just before the stop). The elements which could not be processed in time are
+#-# dropped and their number is logged; the index may then miss these changes until they are indexed again. When the Solr
+#-# server does not answer, the stop waits for the whole timeout. Set it to 0 to drop the queued elements immediately.
+#-# Note that the stop timeout of the servlet container or of the container orchestrator should cover this timeout in
+#-# addition to the shutdown time of the other components.
+#-# The default is 30000 (30 seconds).
+# solr.indexer.shutdownTimeout=30000
+
 #-# [Since 6.1M2]
 #-# Indicates if a synchronization between SOLR index and XWiki database should be performed at startup.
 #-# Synchronization can be started from the search administration UI.

@@ -139,6 +139,21 @@ public class DefaultSolrConfiguration implements SolrConfiguration
     public static final int SOLR_INDEXER_QUEUE_CAPACITY_DEFAULT = 100000;
 
     /**
+     * The name of the configuration property containing the maximum time in milliseconds to wait for the indexer to
+     * process its queues when XWiki stops.
+     *
+     * @since 18.9.0RC1
+     */
+    public static final String SOLR_INDEXER_SHUTDOWN_TIMEOUT_PROPERTY = "solr.indexer.shutdownTimeout";
+
+    /**
+     * The default maximum time in milliseconds to wait for the indexer to process its queues when XWiki stops.
+     *
+     * @since 18.9.0RC1
+     */
+    public static final long SOLR_INDEXER_SHUTDOWN_TIMEOUT_DEFAULT = 30000;
+
+    /**
      * The name of the configuration property indicating if a synchronization should be run at startup.
      */
     public static final String SOLR_SYNCHRONIZE_AT_STARTUP = "solr.synchronizeAtStartup";
@@ -253,6 +268,13 @@ public class DefaultSolrConfiguration implements SolrConfiguration
     {
         return this.configuration.getProperty(SOLR_INDEXER_QUEUE_CAPACITY_PROPERTY,
             SOLR_INDEXER_QUEUE_CAPACITY_DEFAULT);
+    }
+
+    @Override
+    public long getIndexerShutdownTimeout()
+    {
+        return this.configuration.getProperty(SOLR_INDEXER_SHUTDOWN_TIMEOUT_PROPERTY,
+            SOLR_INDEXER_SHUTDOWN_TIMEOUT_DEFAULT);
     }
 
     @Override
