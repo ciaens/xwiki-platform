@@ -68,6 +68,32 @@
 #-# more clear.
 # core.hierarchyMode = reference
 
+#-# [Since 18.10.0RC1]
+#-# Indicate if XWiki should start initializing (database schema updates and migrations, extensions, main wiki) as soon
+#-# as the servlet container starts the web application, instead of waiting for the first HTTP request.
+#-# This is what orchestrators relying on probes (e.g. Kubernetes) need: the liveness probe "/health/live" answers 200
+#-# as soon as the web application runs, the startup and readiness probe "/health" answers 503 until the
+#-# initialization is done and 200 afterwards, and the probes never trigger the initialization themselves (see also
+#-# container.health.details below).
+#-# The eager initialization requires the "xwiki.home" property of xwiki.cfg to be set to the absolute URL of the wiki
+#-# including the context path (e.g. https://wiki.example.com/xwiki/), since it's used to build the request the
+#-# initialization is started with (there is no real request yet). When it's not set, the initialization happens at
+#-# the first request like when this property is disabled.
+#-# In a cluster every node starts the initialization (and thus the database migrations) at the same time, which is the
+#-# same situation as several nodes receiving their first request concurrently. When the Distribution Wizard is not
+#-# interactive (see distribution.automaticStartOnMainWiki), it also starts right after the initialization, without
+#-# waiting for an administrator to visit the wiki.
+#-# Default value is false.
+# core.initialization.eager = false
+
+#-# [Since 18.10.0RC1]
+#-# Indicate if the "/health" endpoint exposes the details of each check (initialization progress, distribution state,
+#-# error messages). The endpoint is not authenticated, so by default only the state and the ready flag of each check
+#-# are exposed, and errors are reduced to the class name of their root cause. Even when the details are disabled,
+#-# it's recommended to not expose "/health" through the public reverse proxy or ingress but only to the probes.
+#-# Default value is false.
+# container.health.details = false
+
 #-------------------------------------------------------------------------------------
 # Environment
 #-------------------------------------------------------------------------------------

@@ -191,6 +191,13 @@
       <version>${project.version}</version>
       <scope>runtime</scope>
     </dependency>
+    <!-- Indicators of the health endpoint mapped in the WAR's web.xml -->
+    <dependency>
+      <groupId>org.xwiki.platform</groupId>
+      <artifactId>xwiki-platform-health</artifactId>
+      <version>${project.version}</version>
+      <scope>runtime</scope>
+    </dependency>
     <!-- Most templates are written in Velocity and need macros.vm to be injected -->
     <dependency>
       <groupId>org.xwiki.platform</groupId>
