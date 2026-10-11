@@ -29,11 +29,16 @@ import org.apache.solr.common.SolrDocumentList;
 import org.junit.jupiter.api.Test;
 import org.mockito.Mock;
 import org.xwiki.extension.ExtensionId;
+import org.xwiki.extension.index.internal.ExtensionIndexClusterConfiguration;
 import org.xwiki.extension.index.internal.ExtensionIndexSolrCoreInitializer;
 import org.xwiki.extension.index.internal.ExtensionIndexSolrUtil;
 import org.xwiki.extension.internal.ExtensionFactory;
 import org.xwiki.extension.repository.CoreExtensionRepository;
 import org.xwiki.extension.repository.InstalledExtensionRepository;
+import org.xwiki.observation.event.ApplicationStartedEvent;
+import org.xwiki.observation.remote.ClusterSingletonManager;
+import org.xwiki.observation.remote.ClusterSingletonNodeChangedEvent;
+import org.xwiki.observation.remote.RemoteObservationManagerContext;
 import org.xwiki.properties.ConverterManager;
 import org.xwiki.search.solr.Solr;
 import org.xwiki.search.solr.internal.DefaultSolrUtils;
@@ -42,8 +47,12 @@ import org.xwiki.test.junit5.mockito.ComponentTest;
 import org.xwiki.test.junit5.mockito.InjectMockComponents;
 import org.xwiki.test.junit5.mockito.MockComponent;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.after;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.timeout;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 import static org.xwiki.extension.index.internal.ExtensionIndexSolrCoreInitializer.IS_CORE_EXTENSION;
@@ -62,6 +71,13 @@ import static org.xwiki.search.solr.AbstractSolrCoreInitializer.SOLR_FIELD_ID;
 })
 class ExtensionIndexCleanupListenerTest
 {
+    private static final long TIMEOUT = 10000;
+
+    /**
+     * How long to wait before checking that the cleanup thread was not started.
+     */
+    private static final long NOTHING_HAPPENS_DELAY = 500;
+
     @InjectMockComponents
     private ExtensionIndexCleanupListener listener;
 
@@ -84,6 +100,84 @@ class ExtensionIndexCleanupListenerTest
 
     @Mock
     private SolrClient solrClient;
+
+    @MockComponent
+    private ExtensionIndexClusterConfiguration clusterConfiguration;
+
+    @MockComponent
+    private ClusterSingletonManager singletonManager;
+
+    @MockComponent
+    private RemoteObservationManagerContext remoteObservationManagerContext;
+
+    /**
+     * Make the cleanup find an empty index.
+     */
+    private void mockEmptyIndex() throws Exception
+    {
+        when(this.solr.getClient(ExtensionIndexSolrCoreInitializer.NAME)).thenReturn(this.solrClient);
+        QueryResponse emptyResponse = mock(QueryResponse.class);
+        when(emptyResponse.getResults()).thenReturn(new SolrDocumentList());
+        when(this.solrClient.query(any(SolrQuery.class))).thenReturn(emptyResponse);
+    }
+
+    private void notifySingletonNodeChanged(boolean singletonNode)
+    {
+        // The listener reads the current state from the manager
+        when(this.singletonManager.isSingletonNode()).thenReturn(singletonNode);
+        this.listener.onEvent(new ClusterSingletonNodeChangedEvent(), this.singletonManager, singletonNode);
+    }
+
+    @Test
+    void getEvents()
+    {
+        assertEquals(2, this.listener.getEvents().size());
+        assertEquals(ExtensionIndexCleanupListener.ID, this.listener.getName());
+    }
+
+    @Test
+    void onApplicationStartedWhenSingletonNodeNotRequired() throws Exception
+    {
+        mockEmptyIndex();
+        when(this.clusterConfiguration.isSingletonNodeRequired()).thenReturn(false);
+
+        this.listener.onEvent(new ApplicationStartedEvent(), null, null);
+
+        verify(this.solrClient, timeout(TIMEOUT)).commit();
+        verify(this.singletonManager, never()).isSingletonNode();
+    }
+
+    @Test
+    void onApplicationStartedOnSingletonNode() throws Exception
+    {
+        mockEmptyIndex();
+        when(this.clusterConfiguration.isSingletonNodeRequired()).thenReturn(true);
+        when(this.singletonManager.isSingletonNode()).thenReturn(true);
+
+        this.listener.onEvent(new ApplicationStartedEvent(), null, null);
+
+        verify(this.solrClient, timeout(TIMEOUT)).commit();
+
+        // Losing the role does not trigger anything
+        notifySingletonNodeChanged(false);
+        verify(this.solr, after(NOTHING_HAPPENS_DELAY)).getClient(ExtensionIndexSolrCoreInitializer.NAME);
+    }
+
+    @Test
+    void onApplicationStartedOnOtherMember() throws Exception
+    {
+        mockEmptyIndex();
+        when(this.clusterConfiguration.isSingletonNodeRequired()).thenReturn(true);
+        when(this.singletonManager.isSingletonNode()).thenReturn(false);
+
+        this.listener.onEvent(new ApplicationStartedEvent(), null, null);
+
+        // The cleanup does not run when the current instance becomes the singleton node after its startup: its
+        // extensions did not change, and it might not know all the extensions installed through the previous singleton
+        notifySingletonNodeChanged(true);
+
+        verify(this.solr, after(NOTHING_HAPPENS_DELAY).never()).getClient(any());
+    }
 
     @Test
     void proceed() throws Exception
