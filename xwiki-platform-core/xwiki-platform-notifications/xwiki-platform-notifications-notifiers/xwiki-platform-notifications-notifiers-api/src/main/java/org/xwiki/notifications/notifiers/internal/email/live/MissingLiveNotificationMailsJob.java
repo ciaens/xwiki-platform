@@ -19,12 +19,14 @@
  */
 package org.xwiki.notifications.notifiers.internal.email.live;
 
+import java.util.Iterator;
 import java.util.List;
 
 import javax.inject.Inject;
 import javax.inject.Named;
 
 import org.xwiki.component.annotation.Component;
+import org.xwiki.eventstream.Event;
 import org.xwiki.eventstream.EventSearchResult;
 import org.xwiki.eventstream.EventStore;
 import org.xwiki.eventstream.EventStreamException;
@@ -35,9 +37,15 @@ import org.xwiki.model.reference.DocumentReference;
 import org.xwiki.model.reference.EntityReferenceSerializer;
 import org.xwiki.notifications.notifiers.internal.email.IntervalUsersManager;
 import org.xwiki.notifications.preferences.NotificationEmailInterval;
+import org.xwiki.query.QueryException;
+import org.xwiki.wiki.descriptor.WikiDescriptorManager;
+import org.xwiki.wiki.manager.WikiManagerException;
 
 /**
  * Find and process events that were not send to users who enabled live mail yet.
+ * <p>
+ * The request indicates the wiki of the users (all the wikis when {@code null}) and the cluster members whose events
+ * are resumed (see {@link MissingLiveNotificationMailsRequest#setRemoteObservationIds(List)}).
  * 
  * @version $Id$
  * @since 12.6
@@ -64,6 +72,9 @@ public class MissingLiveNotificationMailsJob
     @Inject
     private IntervalUsersManager intervals;
 
+    @Inject
+    private WikiDescriptorManager wikis;
+
     @Override
     public String getType()
     {
@@ -73,20 +84,74 @@ public class MissingLiveNotificationMailsJob
     @Override
     protected void runInternal() throws Exception
     {
-        List<DocumentReference> users = this.intervals.getUsers(NotificationEmailInterval.LIVE, getRequest().getWiki());
+        List<String> remoteObservationIds = getRequest().getRemoteObservationIds();
+        if (remoteObservationIds != null && remoteObservationIds.isEmpty()) {
+            // No cluster member requested
+            return;
+        }
+
+        String wiki = getRequest().getWiki();
+        if (wiki != null) {
+            resume(wiki);
+        } else {
+            resumeAllWikis();
+        }
+    }
+
+    private void resumeAllWikis()
+    {
+        try {
+            for (String wikiId : this.wikis.getAllIds()) {
+                try {
+                    resume(wikiId);
+                } catch (Exception e) {
+                    // Whatever the failure in one wiki, resume the other wikis
+                    this.logger.error("Failed to resume the live notification mails of the users of wiki [{}]",
+                        wikiId, e);
+                }
+            }
+        } catch (WikiManagerException e) {
+            this.logger.error("Failed to get the wikis in which to resume the live notification mails", e);
+        }
+    }
+
+    private void resume(String wiki) throws QueryException
+    {
+        List<DocumentReference> users = this.intervals.getUsers(NotificationEmailInterval.LIVE, wiki);
 
         for (DocumentReference user : users) {
-            SimpleEventQuery query = new SimpleEventQuery();
-
-            query.withMail(this.referenceSerializer.serialize(user));
+            SimpleEventQuery query = createQuery(user);
 
             try {
                 EventSearchResult result = this.eventStore.search(query);
 
                 result.stream().forEach(event -> this.dispatcher.addEvent(event, user));
             } catch (EventStreamException e) {
-                this.logger.error("Failed to get events to send bby mail to the user [{}]", user, e);
+                this.logger.error("Failed to get events to send by mail to the user [{}]", user, e);
             }
         }
+    }
+
+    private SimpleEventQuery createQuery(DocumentReference user)
+    {
+        SimpleEventQuery query = new SimpleEventQuery();
+
+        query.withMail(this.referenceSerializer.serialize(user));
+
+        List<String> remoteObservationIds = getRequest().getRemoteObservationIds();
+        if (remoteObservationIds != null) {
+            // Only the events produced by the requested cluster members: the mails of the events produced by the other
+            // members are waiting to be sent by those members
+            query.open();
+            for (Iterator<String> it = remoteObservationIds.iterator(); it.hasNext();) {
+                query.eq(Event.FIELD_REMOTE_OBSERVATION_ID, it.next());
+                if (it.hasNext()) {
+                    query.or();
+                }
+            }
+            query.close();
+        }
+
+        return query;
     }
 }

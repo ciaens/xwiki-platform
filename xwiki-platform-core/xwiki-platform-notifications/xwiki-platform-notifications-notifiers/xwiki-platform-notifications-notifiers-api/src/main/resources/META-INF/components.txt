@@ -14,6 +14,7 @@ org.xwiki.notifications.notifiers.internal.email.live.PrefilteringLiveNotificati
 org.xwiki.notifications.notifiers.internal.email.live.PrefilteringLiveNotificationEmailListener
 org.xwiki.notifications.notifiers.internal.email.live.PrefilteringLiveNotificationEmailManager
 org.xwiki.notifications.notifiers.internal.email.live.PrefilteringLiveNotificationEmailSender
+org.xwiki.notifications.notifiers.internal.email.live.PrefilteringLiveNotificationEmailSingletonListener
 org.xwiki.notifications.notifiers.internal.email.NotificationEmailSender
 org.xwiki.notifications.notifiers.internal.email.NotificationUserIterator
 org.xwiki.notifications.notifiers.internal.rss.DefaultNotificationRSSManager

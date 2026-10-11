@@ -29,6 +29,8 @@ import org.xwiki.eventstream.events.EventStreamAddedEvent;
 import org.xwiki.notifications.NotificationConfiguration;
 import org.xwiki.observation.AbstractEventListener;
 import org.xwiki.observation.event.Event;
+import org.xwiki.observation.remote.ClusterSingletonManager;
+import org.xwiki.observation.remote.ClusterSingletonNodeChangedEvent;
 import org.xwiki.observation.remote.RemoteObservationManagerContext;
 
 /**
@@ -56,12 +58,15 @@ public class UserEventDispatcherListener extends AbstractEventListener
     @Inject
     private RemoteObservationManagerContext remoteState;
 
+    @Inject
+    private ClusterSingletonManager singletonManager;
+
     /**
      * Configure the listener.
      */
     public UserEventDispatcherListener()
     {
-        super(NAME, new EventStreamAddedEvent(), new ApplicationReadyEvent());
+        super(NAME, new EventStreamAddedEvent(), new ApplicationReadyEvent(), new ClusterSingletonNodeChangedEvent());
     }
 
     @Override
@@ -76,6 +81,11 @@ public class UserEventDispatcherListener extends AbstractEventListener
                 }
             } else if (event instanceof ApplicationReadyEvent) {
                 this.scheduler.initialize();
+            } else if (event instanceof ClusterSingletonNodeChangedEvent && this.singletonManager.isSingletonNode()) {
+                // The current instance became the cluster singleton node: pre-filter the events without remote
+                // observation identifier which were waiting for the previous singleton node (the event data might be
+                // outdated, the manager tells the current state)
+                this.scheduler.flush();
             }
         }
     }
