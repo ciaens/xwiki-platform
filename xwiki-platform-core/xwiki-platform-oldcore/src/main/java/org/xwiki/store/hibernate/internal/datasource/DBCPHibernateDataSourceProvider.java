@@ -23,6 +23,7 @@ import java.io.PrintWriter;
 import java.io.StringWriter;
 import java.net.URL;
 import java.sql.SQLException;
+import java.util.HashMap;
 import java.util.Iterator;
 import java.util.Map;
 import java.util.Properties;
@@ -36,8 +37,11 @@ import org.apache.commons.dbcp2.BasicDataSourceFactory;
 import org.apache.commons.lang3.StringUtils;
 import org.hibernate.boot.cfgxml.spi.LoadedConfig;
 import org.hibernate.boot.registry.BootstrapServiceRegistryBuilder;
+import org.hibernate.boot.registry.StandardServiceRegistryBuilder;
 import org.hibernate.cfg.AvailableSettings;
+import org.hibernate.cfg.Environment;
 import org.hibernate.engine.jdbc.connections.internal.ConnectionProviderInitiator;
+import org.hibernate.internal.util.config.ConfigurationHelper;
 import org.slf4j.Logger;
 import org.xwiki.component.annotation.Component;
 import org.xwiki.component.manager.ComponentLifecycleException;
@@ -99,10 +103,7 @@ public class DBCPHibernateDataSourceProvider implements HibernateDataSourceProvi
             LoadedConfig loadedConfig =
                 this.cfgXmlLoader.loadConfig(bootstrapServiceRegistry, configurationURL);
 
-            @SuppressWarnings("unchecked")
-            Map<String, String> values = loadedConfig.getConfigurationValues();
-
-            this.dataSource = createBasicDataSource(values);
+            this.dataSource = createBasicDataSource(getSettings(loadedConfig));
 
             // The BasicDataSource has lazy initialization.
             // Borrowing a connection will start the DataSource and make sure it is configured correctly.
@@ -149,6 +150,32 @@ public class DBCPHibernateDataSourceProvider implements HibernateDataSourceProvi
             }
             this.dataSource = null;
         }
+    }
+
+    /**
+     * Compute the settings of the pool the same way {@link StandardServiceRegistryBuilder} computes the settings that
+     * it passes to the connection provider: the Hibernate {@link Environment} properties (system properties and
+     * {@code hibernate.properties}), overridden by the values of the cfg.xml file, with the {@code ${...}}
+     * placeholders resolved from the system properties (a placeholder without a matching system property is replaced
+     * by an empty string, and a value that becomes empty is removed).
+     *
+     * @param loadedConfig the cfg.xml configuration
+     * @return the settings to create the pool from
+     */
+    static Map<String, String> getSettings(LoadedConfig loadedConfig)
+    {
+        Map<Object, Object> settings = new HashMap<>(Environment.getProperties());
+        settings.putAll(loadedConfig.getConfigurationValues());
+        ConfigurationHelper.resolvePlaceHolders(settings);
+
+        Map<String, String> stringSettings = new HashMap<>(settings.size());
+        for (Map.Entry<Object, Object> entry : settings.entrySet()) {
+            if (entry.getKey() instanceof String key && entry.getValue() instanceof String value) {
+                stringSettings.put(key, value);
+            }
+        }
+
+        return stringSettings;
     }
 
     private BasicDataSource createBasicDataSource(Map<String, String> props) throws SQLException
