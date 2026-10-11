@@ -40,6 +40,7 @@ import org.apache.solr.common.params.CommonParams;
 import org.apache.solr.common.params.CoreAdminParams.CoreAdminAction;
 import org.apache.solr.common.util.NamedList;
 import org.xwiki.component.annotation.Component;
+import org.xwiki.component.annotation.DisposePriority;
 import org.xwiki.component.phase.Initializable;
 import org.xwiki.component.phase.InitializationException;
 import org.xwiki.search.solr.SolrException;
@@ -55,6 +56,9 @@ import org.xwiki.search.solr.internal.api.SolrConfiguration;
 @Component
 @Named(RemoteSolr.TYPE)
 @Singleton
+// Close the Solr clients at the end, like the embedded Solr, since the components using them (the event store for
+// example) may still need them while they are disposed
+@DisposePriority(10000)
 public class RemoteSolr extends AbstractSolr implements Initializable
 {
     /**
