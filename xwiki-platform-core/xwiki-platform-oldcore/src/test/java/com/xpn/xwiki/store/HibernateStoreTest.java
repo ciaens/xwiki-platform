@@ -23,6 +23,8 @@ import java.lang.reflect.Field;
 import java.sql.SQLException;
 import java.util.Properties;
 
+import javax.sql.DataSource;
+
 import org.hibernate.HibernateException;
 import org.hibernate.Transaction;
 import org.hibernate.cfg.Configuration;
@@ -33,6 +35,7 @@ import org.xwiki.component.util.ReflectionUtils;
 import org.xwiki.context.Execution;
 import org.xwiki.context.ExecutionContext;
 import org.xwiki.environment.Environment;
+import org.xwiki.store.hibernate.HibernateDataSourceProvider;
 import org.xwiki.test.annotation.AfterComponent;
 import org.xwiki.test.junit5.mockito.ComponentTest;
 import org.xwiki.test.junit5.mockito.InjectMockComponents;
@@ -61,6 +64,9 @@ class HibernateStoreTest
 
     @MockComponent
     private HibernateConfiguration configuration;
+
+    @MockComponent
+    private HibernateDataSourceProvider dataSourceProvider;
 
     @Mock
     private Transaction transaction;
@@ -101,7 +107,7 @@ class HibernateStoreTest
     }
 
     @Test
-    void getDatabaseProductNameWhenNoSessionFactory() throws Exception
+    void getDatabaseProductNameWhenNoDataSource() throws Exception
     {
         Field field = ReflectionUtils.getField(this.store.getClass(), "configuration");
         field.setAccessible(true);
@@ -109,6 +115,10 @@ class HibernateStoreTest
         Properties properties = new Properties();
         properties.setProperty("hibernate.connection.url", "jdbc:mysql://localhost/xwiki?useSSL=false");
         storeConfiguration.addProperties(properties);
+
+        DataSource mockDataSource = mock();
+        when(this.dataSourceProvider.getDataSource()).thenReturn(mockDataSource);
+        when(mockDataSource.getConnection()).thenThrow(new SQLException("No DataSource"));
 
         assertEquals(DatabaseProduct.MYSQL, this.store.getDatabaseProductName());
     }
