@@ -164,6 +164,22 @@ public class DefaultSolrConfiguration implements SolrConfiguration
     public static final String SOLR_SYNCHRONIZE_BATCH_SIZE = "solr.synchronizeBatchSize";
 
     /**
+     * The name of the configuration property containing the delay (in seconds) before a member which becomes the
+     * cluster singleton node synchronizes a remote Solr index.
+     *
+     * @since 18.9.0RC1
+     */
+    public static final String SOLR_SYNCHRONIZE_ON_SINGLETON_GAIN_DELAY = "solr.synchronizeOnSingletonGainDelay";
+
+    /**
+     * The default delay (in seconds) before a member which becomes the cluster singleton node synchronizes a remote
+     * Solr index.
+     *
+     * @since 18.9.0RC1
+     */
+    public static final int SOLR_SYNCHRONIZE_ON_SINGLETON_GAIN_DELAY_DEFAULT = 60;
+
+    /**
      * Indicate which mode to use for synchronize at startup by default.
      */
     public static final SynchronizeAtStartupMode SOLR_SYNCHRONIZE_AT_STARTUP_MODE_DEFAULT =
@@ -288,5 +304,12 @@ public class DefaultSolrConfiguration implements SolrConfiguration
     public int getSynchronizationBatchSize()
     {
         return this.configuration.getProperty(SOLR_SYNCHRONIZE_BATCH_SIZE, SOLR_SYNCHRONIZE_BATCH_SIZE_DEFAULT);
+    }
+
+    @Override
+    public int getSynchronizeOnSingletonGainDelay()
+    {
+        return this.configuration.getProperty(SOLR_SYNCHRONIZE_ON_SINGLETON_GAIN_DELAY,
+            SOLR_SYNCHRONIZE_ON_SINGLETON_GAIN_DELAY_DEFAULT);
     }
 }
