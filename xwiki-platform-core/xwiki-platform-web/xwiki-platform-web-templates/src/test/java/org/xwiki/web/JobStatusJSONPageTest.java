@@ -20,6 +20,7 @@
 package org.xwiki.web;
 
 import java.io.StringWriter;
+import java.nio.channels.ClosedByInterruptException;
 import java.util.Collection;
 
 import javax.inject.Inject;
@@ -38,6 +39,8 @@ import org.xwiki.template.TemplateManager;
 import org.xwiki.test.junit5.mockito.MockComponent;
 import org.xwiki.test.page.PageTest;
 import org.xwiki.velocity.VelocityManager;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
 
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.containsString;
@@ -94,6 +97,94 @@ class JobStatusJSONPageTest extends PageTest
     }
 
     @Test
+    void jobInterrupted() throws Exception
+    {
+        // The interruption is nested in the cause chain of the error.
+        DefaultJobStatus<DefaultRequest> status = createFinishedJobStatus(new JobException("Failed to move the page",
+            new RuntimeException(new InterruptedException("sleep interrupted"))));
+        status.setCancelable(true);
+
+        String message = renderJobStatusMessage(status);
+
+        assertThat(message, containsString("box warningmessage"));
+        assertThat(message, containsString("[test.finish.interrupted, job.status.testJob.interrupted, job.status.interrupted]"));
+        assertThat(message, not(containsString("errormessage")));
+    }
+
+    @Test
+    void notCancelableJobInterrupted() throws Exception
+    {
+        DefaultJobStatus<DefaultRequest> status = createFinishedJobStatus(
+            new JobException("Failed to write the file", new ClosedByInterruptException()));
+
+        String message = renderJobStatusMessage(status);
+
+        assertThat(message, containsString("box warningmessage"));
+        assertThat(message, containsString("[test.finish.interrupted, job.status.testJob.interrupted, job.status.interrupted]"));
+        assertThat(message, not(containsString("errormessage")));
+    }
+
+    @Test
+    void jobDroppedAtShutdown() throws Exception
+    {
+        // A job which never ran because XWiki was stopping: canceled, with an error caused by an interruption.
+        DefaultJobStatus<DefaultRequest> status = createFinishedJobStatus(new JobException(
+            "The job has not been executed because XWiki is stopping", new InterruptedException("XWiki is stopping")));
+        status.setCancelable(true);
+        status.cancel();
+
+        String message = renderJobStatusMessage(status);
+
+        assertThat(message, containsString("box warningmessage"));
+        assertThat(message, containsString("[test.finish.interrupted, job.status.testJob.interrupted, job.status.interrupted]"));
+        assertThat(message, not(containsString("errormessage")));
+    }
+
+    @Test
+    void canceledJobWithError() throws Exception
+    {
+        // A job canceled by a user which then failed for another reason is displayed as failed.
+        DefaultJobStatus<DefaultRequest> status =
+            createFinishedJobStatus(new JobException("Failed to move the page", new RuntimeException("cause")));
+        status.setCancelable(true);
+        status.cancel();
+
+        String message = renderJobStatusMessage(status);
+
+        assertThat(message, containsString("box errormessage"));
+        assertThat(message, containsString("job.status.testJob.error, job.status.error]"));
+        assertThat(message, not(containsString("interrupted")));
+    }
+
+    @Test
+    void jobFailed() throws Exception
+    {
+        DefaultJobStatus<DefaultRequest> status =
+            createFinishedJobStatus(new JobException("Failed to move the page", new RuntimeException("cause")));
+        status.setCancelable(true);
+
+        String message = renderJobStatusMessage(status);
+
+        assertThat(message, containsString("box errormessage"));
+        assertThat(message, containsString("job.status.testJob.error, job.status.error]"));
+        assertThat(message, not(containsString("interrupted")));
+    }
+
+    @Test
+    void jobCanceled() throws Exception
+    {
+        DefaultJobStatus<DefaultRequest> status = createFinishedJobStatus(null);
+        status.setCancelable(true);
+        status.cancel();
+
+        String message = renderJobStatusMessage(status);
+
+        assertThat(message, containsString("box warningmessage"));
+        assertThat(message, containsString("job.status.testJob.canceled, job.status.canceled]"));
+        assertThat(message, not(containsString("interrupted")));
+    }
+
+    @Test
     void displayJobStatusOfFailedJob() throws Exception
     {
         DefaultJobStatus<DefaultRequest> status =
@@ -107,6 +198,18 @@ class JobStatusJSONPageTest extends PageTest
         assertThat(output, not(containsString("job.status.success")));
     }
 
+    @Test
+    void displayJobStatusOfInterruptedJob() throws Exception
+    {
+        DefaultJobStatus<DefaultRequest> status =
+            createFinishedJobStatus(new JobException("Failed to move the page", new InterruptedException()));
+
+        String output = renderJobMacro(status, "#displayJobStatus($jobStatus 'test')");
+
+        assertThat(output, containsString("box warningmessage"));
+        assertThat(output, containsString("[test.finish.interrupted, job.status.testJob.interrupted, job.status.interrupted]"));
+    }
+
     private DefaultJobStatus<DefaultRequest> createFinishedJobStatus(Throwable error)
     {
         DefaultRequest request = new DefaultRequest();
@@ -115,6 +218,14 @@ class JobStatusJSONPageTest extends PageTest
         status.setError(error);
         status.setState(JobStatus.State.FINISHED);
         return status;
+    }
+
+    private String renderJobStatusMessage(JobStatus status) throws Exception
+    {
+        // The JSON returned by job_status_json.vm for the passed job status.
+        String output = renderJobMacro(status, "#outputJobStatusJSON($jobStatus 'test')");
+
+        return new ObjectMapper().readTree(output).get("message").asText();
     }
 
     private String renderJobMacro(JobStatus status, String macroCall) throws Exception
