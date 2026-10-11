@@ -28,10 +28,10 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
-import javax.inject.Inject;
-import javax.inject.Named;
-import javax.inject.Provider;
-import javax.inject.Singleton;
+import jakarta.inject.Inject;
+import jakarta.inject.Named;
+import jakarta.inject.Provider;
+import jakarta.inject.Singleton;
 
 import org.apache.commons.collections4.CollectionUtils;
 import org.apache.commons.lang3.LocaleUtils;
@@ -50,7 +50,9 @@ import org.xwiki.model.reference.DocumentReferenceResolver;
 import org.xwiki.observation.EventListener;
 import org.xwiki.observation.event.Event;
 import org.xwiki.observation.event.filter.RegexEventFilter;
+import org.xwiki.observation.remote.RemoteObservationManagerContext;
 import org.xwiki.search.solr.internal.api.FieldUtils;
+import org.xwiki.search.solr.internal.api.SolrConfiguration;
 import org.xwiki.search.solr.internal.api.SolrIndexer;
 import org.xwiki.search.solr.internal.api.SolrInstance;
 
@@ -113,6 +115,18 @@ public class SolrIndexAvailableLocalesListener implements EventListener
     @Inject
     private DocumentReferenceResolver<SolrDocument> solrDocumentReferenceResolver;
 
+    /**
+     * Used to know if the event comes from another cluster member.
+     */
+    @Inject
+    private RemoteObservationManagerContext remoteObservationManagerContext;
+
+    /**
+     * Used to know if the Solr server is shared by all the cluster members.
+     */
+    @Inject
+    private SolrConfiguration solrConfiguration;
+
     @Override
     public List<Event> getEvents()
     {
@@ -140,8 +154,9 @@ public class SolrIndexAvailableLocalesListener implements EventListener
 
         try {
             // oldLocales may be null in case the XWikiPreferences has been modified as part of a mandatory document
-            // initialization
-            if (oldLocales != null && event instanceof AbstractDocumentEvent) {
+            // initialization. The cache above is updated for remote events too, but a Solr index shared by all the
+            // cluster members is re-indexed only by the member where the preferences were changed.
+            if (oldLocales != null && event instanceof AbstractDocumentEvent && !isRemoteEventOnSharedIndex()) {
                 Collection<Locale> newLocales = CollectionUtils.subtract(availableLocales, oldLocales);
 
                 if (!newLocales.isEmpty()) {
@@ -188,6 +203,11 @@ public class SolrIndexAvailableLocalesListener implements EventListener
             // an arbitrary object whose graph would be written out and read back as null if it cannot be resolved.
             this.logger.error("Failed to handle event [{}] with source [{}]", event, String.valueOf(source), e);
         }
+    }
+
+    private boolean isRemoteEventOnSharedIndex()
+    {
+        return this.remoteObservationManagerContext.isRemoteState() && this.solrConfiguration.isIndexShared();
     }
 
     /**

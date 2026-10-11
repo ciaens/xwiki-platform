@@ -808,6 +808,9 @@ distribution.automaticStartOnWiki=$xwikiPropertiesAutomaticStartOnWiki
 
 #-# [Since 4.5M1]
 #-# The Solr server type. Currently accepted values are "embedded" (default) and "remote".
+#-# In a cluster (remote observation enabled), a "remote" Solr server must be shared by all the cluster members: since
+#-# 18.9.0RC1 each change is sent to it only by the member where the change happened. With "embedded", each member
+#-# indexes the changes of all the members in its own index.
 # solr.type=embedded
 
 #-# [Since 4.5M1]
