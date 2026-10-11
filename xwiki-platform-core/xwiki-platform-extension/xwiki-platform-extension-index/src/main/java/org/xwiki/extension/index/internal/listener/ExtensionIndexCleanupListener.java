@@ -20,7 +20,6 @@
 package org.xwiki.extension.index.internal.listener;
 
 import java.io.IOException;
-import java.util.List;
 import java.util.Objects;
 
 import javax.inject.Inject;
@@ -36,11 +35,12 @@ import org.apache.solr.common.SolrDocument;
 import org.slf4j.Logger;
 import org.xwiki.component.annotation.Component;
 import org.xwiki.extension.ExtensionId;
+import org.xwiki.extension.index.internal.ExtensionIndexClusterConfiguration;
 import org.xwiki.extension.index.internal.ExtensionIndexSolrCoreInitializer;
 import org.xwiki.extension.index.internal.ExtensionIndexSolrUtil;
 import org.xwiki.extension.repository.CoreExtensionRepository;
 import org.xwiki.extension.repository.InstalledExtensionRepository;
-import org.xwiki.observation.EventListener;
+import org.xwiki.observation.event.AbstractClusterSingletonListener;
 import org.xwiki.observation.event.ApplicationStartedEvent;
 import org.xwiki.observation.event.Event;
 import org.xwiki.search.solr.Solr;
@@ -54,6 +54,12 @@ import static org.xwiki.search.solr.AbstractSolrCoreInitializer.SOLR_FIELD_ID;
 /**
  * Cleanup the extension index of entries related to artifacts that are not available anymore (e.g., upgrade or manual
  * manipulation of the directories storing jar files).
+ * <p>
+ * When the extension index is shared by the members of the cluster (see
+ * {@link ExtensionIndexClusterConfiguration#isSingletonNodeRequired()}), the cleanup runs only when the cluster
+ * singleton node starts: the other members might know different extensions (for example during a rolling upgrade). It
+ * does not run when another member becomes the singleton node later, since that member's extensions did not change and
+ * it might not know all the extensions installed through the previous singleton node.
  *
  * @version $Id$
  * @since 15.9RC1
@@ -61,7 +67,7 @@ import static org.xwiki.search.solr.AbstractSolrCoreInitializer.SOLR_FIELD_ID;
 @Component
 @Singleton
 @Named(ExtensionIndexCleanupListener.ID)
-public class ExtensionIndexCleanupListener implements EventListener
+public class ExtensionIndexCleanupListener extends AbstractClusterSingletonListener
 {
     /**
      * The hint of this component.
@@ -84,22 +90,32 @@ public class ExtensionIndexCleanupListener implements EventListener
     private ExtensionIndexSolrUtil extensionIndexSolrUtil;
 
     @Inject
+    private ExtensionIndexClusterConfiguration clusterConfiguration;
+
+    @Inject
     private Logger logger;
 
-    @Override
-    public String getName()
+    /**
+     * Default constructor.
+     */
+    public ExtensionIndexCleanupListener()
     {
-        return ID;
+        super(ID, new ApplicationStartedEvent());
     }
 
     @Override
-    public List<Event> getEvents()
+    protected boolean isSingletonNodeRequired()
     {
-        return List.of(new ApplicationStartedEvent());
+        return this.clusterConfiguration.isSingletonNodeRequired();
     }
 
     @Override
-    public void onEvent(Event event, Object source, Object data)
+    protected void processSingletonEvent(Event event, Object source, Object data)
+    {
+        startCleanup();
+    }
+
+    private void startCleanup()
     {
         Thread thread = new Thread(this::proceed);
         thread.setName(ID);

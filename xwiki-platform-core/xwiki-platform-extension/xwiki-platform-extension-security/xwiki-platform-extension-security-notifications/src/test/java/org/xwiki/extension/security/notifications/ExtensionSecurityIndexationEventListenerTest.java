@@ -24,6 +24,8 @@ import java.util.Set;
 import org.junit.jupiter.api.Test;
 import org.xwiki.observation.ObservationManager;
 import org.xwiki.observation.event.Event;
+import org.xwiki.observation.remote.ClusterSingletonManager;
+import org.xwiki.observation.remote.RemoteObservationManagerConfiguration;
 import org.xwiki.test.junit5.mockito.ComponentTest;
 import org.xwiki.test.junit5.mockito.InjectMockComponents;
 import org.xwiki.test.junit5.mockito.MockComponent;
@@ -31,6 +33,7 @@ import org.xwiki.test.junit5.mockito.MockComponent;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
+import static org.mockito.Mockito.when;
 
 /**
  * Test of {@link ExtensionSecurityIndexationEventListener}.
@@ -47,6 +50,12 @@ class ExtensionSecurityIndexationEventListenerTest
     @MockComponent
     private ObservationManager observationManager;
 
+    @MockComponent
+    private RemoteObservationManagerConfiguration remoteObservationConfiguration;
+
+    @MockComponent
+    private ClusterSingletonManager singletonManager;
+
     @Test
     void processLocalEventData0()
     {
@@ -61,5 +70,28 @@ class ExtensionSecurityIndexationEventListenerTest
         verify(this.observationManager).notify(
             new NewExtensionSecurityVulnerabilityTargetableEvent(Set.of("xwiki:XWiki.XWikiAdminGroup")),
             "org.xwiki.platform:xwiki-platform-extension-security-notifications", "1");
+    }
+
+    @Test
+    void processLocalEventOnClusterSingletonNode()
+    {
+        when(this.remoteObservationConfiguration.isEnabled()).thenReturn(true);
+        when(this.singletonManager.isSingletonNode()).thenReturn(true);
+
+        this.listener.processLocalEvent(mock(Event.class), "source", 2L);
+        verify(this.observationManager).notify(
+            new NewExtensionSecurityVulnerabilityTargetableEvent(Set.of("xwiki:XWiki.XWikiAdminGroup")),
+            "org.xwiki.platform:xwiki-platform-extension-security-notifications", "2");
+    }
+
+    @Test
+    void processLocalEventOnOtherClusterMember()
+    {
+        // Each member with its own index scans it: only the singleton node notifies the new vulnerabilities
+        when(this.remoteObservationConfiguration.isEnabled()).thenReturn(true);
+        when(this.singletonManager.isSingletonNode()).thenReturn(false);
+
+        this.listener.processLocalEvent(mock(Event.class), "source", 2L);
+        verifyNoInteractions(this.observationManager);
     }
 }
