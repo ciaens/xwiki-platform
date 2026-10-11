@@ -19,6 +19,8 @@
  */
 package org.xwiki.notifications.notifiers.internal.email.live;
 
+import java.util.Collections;
+
 import javax.inject.Inject;
 import javax.inject.Named;
 import javax.inject.Singleton;
@@ -31,11 +33,19 @@ import org.xwiki.eventstream.events.MailEntityAddedEvent;
 import org.xwiki.notifications.NotificationConfiguration;
 import org.xwiki.observation.AbstractEventListener;
 import org.xwiki.observation.event.Event;
+import org.xwiki.observation.remote.RemoteObservationManagerConfiguration;
 import org.xwiki.observation.remote.RemoteObservationManagerContext;
 import org.xwiki.wiki.descriptor.WikiDescriptorManager;
 
 /**
  * This listener is responsible of sending mails to users who enabled live mails.
+ * <p>
+ * When the instance starts, it resumes the mails which were not sent yet. Without cluster, all of them: for the main
+ * wiki when the application is ready and for each other wiki when it's ready. In a cluster, only the mails of the
+ * events produced by the current instance, for all the wikis when the application is ready (a subwiki might never be
+ * loaded on a member, for example an instance dedicated to background tasks, which still produces events): the mails
+ * of the events produced by the other members are waiting to be sent by those members, and the mails of the events
+ * without cluster member identifier are resumed by {@link PrefilteringLiveNotificationEmailSingletonListener}.
  *
  * @since 12.6
  * @version $Id$
@@ -62,6 +72,9 @@ public class PrefilteringLiveNotificationEmailListener extends AbstractEventList
     @Inject
     private WikiDescriptorManager wikis;
 
+    @Inject
+    private RemoteObservationManagerConfiguration remoteObservationConfiguration;
+
     /**
      * Constructs a new {@link PrefilteringLiveNotificationEmailListener}.
      */
@@ -84,9 +97,17 @@ public class PrefilteringLiveNotificationEmailListener extends AbstractEventList
             } else if (event instanceof ApplicationReadyEvent) {
                 // Load all the events for which live mail was processing was not finished and send them
                 // Don't block the event thread
-                this.manager.addEvents(this.wikis.getMainWikiId());
-            } else if (event instanceof WikiReadyEvent wikiReadyEvent) {
-                // Load all the events for which live mail was processing was not finished and send them
+                if (this.remoteObservationConfiguration.isEnabled()) {
+                    // Only the events produced by the current instance (before it was restarted), in all the wikis
+                    this.manager.addEvents(null,
+                        Collections.singletonList(this.remoteObservationConfiguration.getId()));
+                } else {
+                    this.manager.addEvents(this.wikis.getMainWikiId());
+                }
+            } else if (event instanceof WikiReadyEvent wikiReadyEvent
+                && !this.remoteObservationConfiguration.isEnabled()) {
+                // Load all the events for which live mail was processing was not finished and send them (in a cluster
+                // all the wikis are handled when the application is ready)
                 // Don't block the event thread
                 this.manager.addEvents(wikiReadyEvent.getWikiId());
             }

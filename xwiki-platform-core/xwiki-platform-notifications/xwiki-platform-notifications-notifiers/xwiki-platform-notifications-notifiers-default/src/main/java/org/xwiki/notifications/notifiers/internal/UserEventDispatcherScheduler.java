@@ -22,6 +22,7 @@ package org.xwiki.notifications.notifiers.internal;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
@@ -72,11 +73,15 @@ public class UserEventDispatcherScheduler implements Disposable
 
     private volatile boolean running;
 
+    private volatile boolean initialized;
+
     /**
      * Start the scheduler.
      */
     public void initialize()
     {
+        this.initialized = true;
+
         // Schedule a job to regularly check if any event prefiltering was missed or a previous run failed
         this.scheduler.scheduleWithFixedDelay(this::run, 0, 1, TimeUnit.HOURS);
     }
@@ -95,6 +100,26 @@ public class UserEventDispatcherScheduler implements Disposable
             }
         } catch (EventStreamException e) {
             this.logger.error("Failed to get supported event types", e);
+        }
+    }
+
+    /**
+     * Pre-filter the waiting events as soon as possible, unless the scheduler is not started yet (the first run happens
+     * when it's started). The request is never dropped: when a run is already in progress, a new run follows it, so
+     * that the events which became eligible during the current run (for example when the current instance just became
+     * the cluster singleton node) are not left waiting for the next scheduled run.
+     *
+     * @since 18.9.0RC1
+     */
+    public void flush()
+    {
+        if (this.initialized) {
+            try {
+                this.scheduler.execute(this::run);
+            } catch (RejectedExecutionException e) {
+                // The component is disposed: the instance is stopping
+                this.logger.debug("Ignoring the pre-filtering request received after the scheduler was stopped", e);
+            }
         }
     }
 
