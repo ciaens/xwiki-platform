@@ -20,15 +20,18 @@
 package com.xpn.xwiki.plugin.scheduler;
 
 import java.net.URL;
+import java.text.ParseException;
 import java.util.ArrayList;
 import java.util.Date;
 import java.util.List;
+import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
 
 import javax.inject.Provider;
 
 import org.apache.commons.lang3.exception.ExceptionUtils;
+import org.quartz.CronExpression;
 import org.quartz.CronScheduleBuilder;
 import org.quartz.Job;
 import org.quartz.JobBuilder;
@@ -70,6 +73,7 @@ import com.xpn.xwiki.doc.XWikiDocument;
 import com.xpn.xwiki.objects.BaseObject;
 import com.xpn.xwiki.plugin.XWikiDefaultPlugin;
 import com.xpn.xwiki.plugin.XWikiPluginInterface;
+import com.xpn.xwiki.plugin.scheduler.internal.SchedulerClusterSingletonListener;
 import com.xpn.xwiki.plugin.scheduler.internal.SchedulerJobClassDocumentInitializer;
 import com.xpn.xwiki.plugin.scheduler.internal.SchedulerJobsInitializedEvent;
 import com.xpn.xwiki.plugin.scheduler.internal.SchedulerJobsInitializingEvent;
@@ -115,6 +119,16 @@ public class SchedulerPlugin extends XWikiDefaultPlugin implements EventListener
 
     private static final String NORMAL = "Normal";
 
+    private static final String NONE = "None";
+
+    private static final String CRON = "cron";
+
+    private static final String CONTEXT_USER = "contextUser";
+
+    private static final String CONTEXT_LANG = "contextLang";
+
+    private static final String CONTEXT_DATABASE = "contextDatabase";
+
     /**
      * How long to wait for the running jobs to finish when XWiki stops, in seconds.
      */
@@ -150,7 +164,8 @@ public class SchedulerPlugin extends XWikiDefaultPlugin implements EventListener
     private SchedulersClassLoaderManager schedulersClassLoaderManager;
 
     /**
-     * Guards the creation of the Quartz scheduler, the restoration of each job and {@link #stopped}.
+     * Guards the creation, the start and the stop of the Quartz scheduler, the restoration of each job,
+     * {@link #stopped} and {@link #lifecycleGeneration}.
      */
     private final Object lifecycleLock = new Object();
 
@@ -158,6 +173,12 @@ public class SchedulerPlugin extends XWikiDefaultPlugin implements EventListener
      * True once XWiki is stopping: the scheduler must not be started anymore.
      */
     private boolean stopped;
+
+    /**
+     * Incremented each time the scheduler is started or stopped, so that a start which is still restoring the jobs
+     * gives up when the scheduler is stopped (or started again) in the meantime.
+     */
+    private long lifecycleGeneration;
 
     /**
      * Default plugin constructor.
@@ -178,16 +199,111 @@ public class SchedulerPlugin extends XWikiDefaultPlugin implements EventListener
         this.schedulersClassLoaderManager = Utils.getComponent(SchedulersClassLoaderManager.class);
         this.schedulersClassLoaderManager.setSchedulerPlugin(this);
 
-        if (this.enabled) {
-            Thread thread = new Thread(new ExecutionContextRunnable(this::initAsync,
-                Utils.getComponentManager()));
-            thread.setName("XWiki Scheduler initialization");
-            thread.setDaemon(true);
+        ObservationManager observation = Utils.getComponent(ObservationManager.class);
 
-            thread.start();
+        // When scheduler.clusterSingleton is enabled in a cluster, the scheduler runs only on the cluster singleton
+        // node: the listener starts it when the application is ready and moves it when the singleton node changes (it's
+        // also registered when the scheduler is disabled on this instance, to warn when no member runs the scheduler)
+        SchedulerClusterSingletonListener singletonListener =
+            Utils.getComponent(SchedulerClusterSingletonListener.class);
+        boolean singletonNodeRequired = singletonListener.isSingletonNodeRequired();
+        if (singletonNodeRequired) {
+            singletonListener.setSchedulerPlugin(this);
+            observation.addListener(singletonListener);
+        }
+
+        if (this.enabled) {
+            if (!singletonNodeRequired) {
+                startScheduler();
+            }
 
             // Start listening to documents modifications
-            Utils.getComponent(ObservationManager.class).addListener(this);
+            observation.addListener(this);
+        }
+    }
+
+    /**
+     * Starts the scheduler in a background thread, then restores the jobs of all the wikis from their pages. Does
+     * nothing when the scheduler is disabled or when XWiki is stopping. Starting a scheduler which is already running
+     * restores the jobs again, which leaves them in the state stored in their pages.
+     * <p>
+     * When {@code scheduler.clusterSingleton} is enabled in a cluster, the scheduler runs only on the cluster singleton
+     * node and this method is called when the current instance becomes the singleton node. It is not meant to be
+     * called by other code.
+     *
+     * @since 18.9.0RC1
+     */
+    @Unstable
+    public void startScheduler()
+    {
+        long generation;
+        synchronized (this.lifecycleLock) {
+            if (!this.enabled || this.stopped) {
+                return;
+            }
+
+            generation = ++this.lifecycleGeneration;
+        }
+
+        Thread thread = new Thread(new ExecutionContextRunnable(() -> initAsync(generation),
+            Utils.getComponentManager()));
+        thread.setName("XWiki Scheduler initialization");
+        thread.setDaemon(true);
+
+        thread.start();
+    }
+
+    /**
+     * Stops firing the jobs and forgets them, without interrupting the running jobs. The jobs are restored from their
+     * pages by the next {@link #startScheduler()}. The status stored in the job pages is not modified.
+     * <p>
+     * When {@code scheduler.clusterSingleton} is enabled in a cluster, this method is called when the current instance
+     * stops being the cluster singleton node. It is not meant to be called by other code.
+     *
+     * @since 18.9.0RC1
+     */
+    @Unstable
+    public void stopScheduler()
+    {
+        synchronized (this.lifecycleLock) {
+            // Make a start in progress give up
+            ++this.lifecycleGeneration;
+
+            Scheduler currentScheduler = getScheduler();
+            if (!this.stopped && currentScheduler != null) {
+                try {
+                    currentScheduler.standby();
+                    currentScheduler.clear();
+                } catch (SchedulerException e) {
+                    LOGGER.warn("Failed to stop the scheduler: [{}]", ExceptionUtils.getRootCauseMessage(e));
+                }
+            }
+        }
+    }
+
+    /**
+     * @return true if the scheduler is firing the jobs on this instance: it is enabled, it was started (only by the
+     *         cluster singleton node when {@code scheduler.clusterSingleton} is enabled) and XWiki is not stopping
+     */
+    private boolean isRunning()
+    {
+        Scheduler currentScheduler = getScheduler();
+        if (currentScheduler == null) {
+            return false;
+        }
+
+        try {
+            // A scheduler is in standby mode until it's started
+            return !currentScheduler.isInStandbyMode() && !currentScheduler.isShutdown();
+        } catch (SchedulerException e) {
+            return false;
+        }
+    }
+
+    private boolean isCurrent(long generation)
+    {
+        synchronized (this.lifecycleLock) {
+            return !this.stopped && generation == this.lifecycleGeneration;
         }
     }
 
@@ -209,7 +325,7 @@ public class SchedulerPlugin extends XWikiDefaultPlugin implements EventListener
         }
     }
 
-    private void initAsync()
+    private void initAsync(long generation)
     {
         XWikiContext xcontext = Utils.<Provider<XWikiContext>>getComponent(XWikiContext.TYPE_PROVIDER).get();
 
@@ -236,13 +352,15 @@ public class SchedulerPlugin extends XWikiDefaultPlugin implements EventListener
             System.setProperty("org.quartz.threadPool.threadPriority", String.valueOf(Thread.NORM_PRIORITY - 1));
 
             synchronized (this.lifecycleLock) {
-                if (this.stopped) {
-                    // XWiki is already stopping
+                if (this.stopped || generation != this.lifecycleGeneration) {
+                    // XWiki is already stopping, or the scheduler was stopped or started again in the meantime
                     return;
                 }
 
-                setScheduler(getDefaultSchedulerInstance());
-                setStatusListener();
+                if (getScheduler() == null) {
+                    setScheduler(getDefaultSchedulerInstance());
+                    setStatusListener();
+                }
                 getScheduler().start();
             }
 
@@ -251,8 +369,12 @@ public class SchedulerPlugin extends XWikiDefaultPlugin implements EventListener
             try {
                 // Iterate on all virtual wikis
                 for (String wikiName : wikiServers) {
+                    if (!isCurrent(generation)) {
+                        break;
+                    }
+
                     xcontext.setWikiId(wikiName);
-                    restoreExistingJobs(xcontext);
+                    restoreExistingJobs(xcontext, generation);
                 }
             } finally {
                 xcontext.setWikiId(initialDb);
@@ -276,6 +398,7 @@ public class SchedulerPlugin extends XWikiDefaultPlugin implements EventListener
         Scheduler currentScheduler;
         synchronized (this.lifecycleLock) {
             this.stopped = true;
+            ++this.lifecycleGeneration;
             currentScheduler = getScheduler();
         }
 
@@ -341,28 +464,11 @@ public class SchedulerPlugin extends XWikiDefaultPlugin implements EventListener
      */
     private XWikiContext prepareJobStubContext(BaseObject job, XWikiContext context) throws SchedulerPluginException
     {
-        boolean jobNeedsUpdate = false;
-        String cUser = job.getStringValue("contextUser");
-        if ("".equals(cUser)) {
-            // The context user has not been filled yet.
-            // We can suppose it's the first scheduling. Let's assume it's the context user
-            cUser = context.getUser();
-            job.setStringValue("contextUser", cUser);
-            jobNeedsUpdate = true;
-        }
-        String cLang = job.getStringValue("contextLang");
-        if ("".equals(cLang)) {
-            cLang = context.getLanguage();
-            job.setStringValue("contextLang", cLang);
-            jobNeedsUpdate = true;
-        }
+        boolean jobNeedsUpdate = fillJobContext(job, context);
+        String cUser = job.getStringValue(CONTEXT_USER);
+        String cLang = job.getStringValue(CONTEXT_LANG);
         String iDb = context.getWikiId();
-        String cDb = job.getStringValue("contextDatabase");
-        if ("".equals(cDb) || !iDb.equals(cDb)) {
-            cDb = context.getWikiId();
-            job.setStringValue("contextDatabase", cDb);
-            jobNeedsUpdate = true;
-        }
+        String cDb = job.getStringValue(CONTEXT_DATABASE);
 
         if (jobNeedsUpdate) {
             try {
@@ -425,14 +531,43 @@ public class SchedulerPlugin extends XWikiDefaultPlugin implements EventListener
     }
 
     /**
+     * Fill the fields of the job object holding the context of the job execution which are empty (this would
+     * typically happen on the first schedule operation) from the passed context, and set the wiki of the passed
+     * context.
+     *
+     * @return true if the job object was modified
+     */
+    private boolean fillJobContext(BaseObject job, XWikiContext context)
+    {
+        boolean jobUpdated = false;
+        if ("".equals(job.getStringValue(CONTEXT_USER))) {
+            // The context user has not been filled yet.
+            // We can suppose it's the first scheduling. Let's assume it's the context user
+            job.setStringValue(CONTEXT_USER, context.getUser());
+            jobUpdated = true;
+        }
+        if ("".equals(job.getStringValue(CONTEXT_LANG))) {
+            job.setStringValue(CONTEXT_LANG, context.getLanguage());
+            jobUpdated = true;
+        }
+        if (!context.getWikiId().equals(job.getStringValue(CONTEXT_DATABASE))) {
+            job.setStringValue(CONTEXT_DATABASE, context.getWikiId());
+            jobUpdated = true;
+        }
+
+        return jobUpdated;
+    }
+
+    /**
      * Restore the existing job, by looking up for such job in the database and re-scheduling those according to their
      * stored status. If a Job is stored with the status "Normal", it is just scheduled If a Job is stored with the
      * status "Paused", then it is both scheduled and paused. Jobs with other status (None, Complete) are not
      * rescheduled.
      * 
      * @param context The XWikiContext when initializing the plugin
+     * @param generation the start which restores the jobs, the restoration stops when it's not the current one anymore
      */
-    private void restoreExistingJobs(XWikiContext context)
+    private void restoreExistingJobs(XWikiContext context, long generation)
     {
         String hql = ", BaseObject as obj where obj.name=doc.fullName and obj.className='XWiki.SchedulerJobClass'";
         try {
@@ -440,9 +575,9 @@ public class SchedulerPlugin extends XWikiDefaultPlugin implements EventListener
                 context.getWiki().getStore().searchDocumentReferences(hql, context);
             for (DocumentReference docReference : jobDocReferences) {
                 try {
-                    // Don't restore a job once XWiki is stopping (the scheduler is shut down)
+                    // Don't restore a job after the scheduler was stopped
                     synchronized (this.lifecycleLock) {
-                        if (this.stopped) {
+                        if (!isCurrent(generation)) {
                             return;
                         }
 
@@ -501,7 +636,30 @@ public class SchedulerPlugin extends XWikiDefaultPlugin implements EventListener
      */
     public JobState getJobStatus(BaseObject object, XWikiContext context) throws SchedulerPluginException
     {
+        if (isEnabled() && !isRunning()) {
+            // The scheduler runs on another cluster member (or is not started yet): the status stored in the job
+            // page is the one it applies
+            return getStoredJobState(object);
+        }
+
         return getCurrentJobState(object);
+    }
+
+    private JobState getStoredJobState(BaseObject object)
+    {
+        TriggerState state;
+        switch (object.getStringValue(STATUS)) {
+            case JobState.STATE_NORMAL:
+                state = TriggerState.NORMAL;
+                break;
+            case JobState.STATE_PAUSED:
+                state = TriggerState.PAUSED;
+                break;
+            default:
+                state = TriggerState.NONE;
+        }
+
+        return new JobState(state);
     }
 
     private JobState getCurrentJobState(BaseObject object) throws SchedulerPluginException
@@ -537,7 +695,7 @@ public class SchedulerPlugin extends XWikiDefaultPlugin implements EventListener
         triggerBuilder.withIdentity(getObjectUniqueId(object));
         triggerBuilder.forJob(getObjectUniqueId(object));
 
-        triggerBuilder.withSchedule(CronScheduleBuilder.cronSchedule(object.getStringValue("cron")));
+        triggerBuilder.withSchedule(CronScheduleBuilder.cronSchedule(object.getStringValue(CRON)));
 
         return triggerBuilder.build();
     }
@@ -583,6 +741,19 @@ public class SchedulerPlugin extends XWikiDefaultPlugin implements EventListener
     public boolean scheduleJob(BaseObject object, XWikiContext context) throws SchedulerPluginException
     {
         checkEnabled();
+
+        if (!isRunning()) {
+            // The scheduler runs on another cluster member (or is not started yet): only store the job state in its
+            // page, the instance running the scheduler applies it when the page is saved (or when it starts)
+            try {
+                saveScheduledJob(object, PAUSED.equals(object.getStringValue(STATUS)) ? PAUSED : NORMAL, context);
+            } catch (XWikiException e) {
+                throw new SchedulerPluginException(SchedulerPluginException.ERROR_SCHEDULERPLUGIN_SCHEDULE_JOB,
+                    "Error while saving job " + object.getStringValue(JOB_NAME), e);
+            }
+
+            return true;
+        }
 
         boolean scheduled = true;
         try {
@@ -650,7 +821,10 @@ public class SchedulerPlugin extends XWikiDefaultPlugin implements EventListener
 
         String job = getObjectUniqueId(object);
         try {
-            getScheduler().pauseJob(new JobKey(job));
+            // When the scheduler is not running on this instance, the instance running it applies the saved status
+            if (isRunning()) {
+                getScheduler().pauseJob(new JobKey(job));
+            }
 
             saveStatus(PAUSED, object, context);
         } catch (SchedulerException e) {
@@ -673,7 +847,10 @@ public class SchedulerPlugin extends XWikiDefaultPlugin implements EventListener
 
         String job = getObjectUniqueId(object);
         try {
-            getScheduler().resumeJob(new JobKey(job));
+            // When the scheduler is not running on this instance, the instance running it applies the saved status
+            if (isRunning()) {
+                getScheduler().resumeJob(new JobKey(job));
+            }
 
             saveStatus(NORMAL, object, context);
         } catch (SchedulerException e) {
@@ -695,6 +872,13 @@ public class SchedulerPlugin extends XWikiDefaultPlugin implements EventListener
     {
         checkEnabled();
 
+        if (!isRunning()) {
+            // Nothing in the job page can ask the instance running the scheduler to execute the job now
+            throw new SchedulerPluginException(SchedulerPluginException.ERROR_SCHEDULERPLUGIN_TRIGGER_JOB,
+                "The scheduler is not running on this instance (it is not started yet, or it runs on another cluster"
+                    + " member): the job " + object.getStringValue(JOB_NAME) + " cannot be triggered from it");
+        }
+
         String job = getObjectUniqueId(object);
         try {
             getScheduler().triggerJob(new JobKey(job));
@@ -714,9 +898,12 @@ public class SchedulerPlugin extends XWikiDefaultPlugin implements EventListener
         checkEnabled();
 
         try {
-            deleteJob(object);
+            // When the scheduler is not running on this instance, the instance running it applies the saved status
+            if (isRunning()) {
+                deleteJob(object);
+            }
 
-            saveStatus("None", object, context);
+            saveStatus(NONE, object, context);
         } catch (XWikiException e) {
             throw new SchedulerPluginException(SchedulerPluginException.ERROR_SCHEDULERPLUGIN_JOB_XCLASS_NOT_FOUND,
                 "Error while saving status of job " + object.getStringValue(JOB_NAME), e);
@@ -751,6 +938,11 @@ public class SchedulerPlugin extends XWikiDefaultPlugin implements EventListener
     {
         // Make sure the scheduler is enabled
         checkEnabled();
+
+        // Nothing to reload when the scheduler is not running on this instance
+        if (!isRunning()) {
+            return;
+        }
 
         // Compute the unique id of the job
         String jobID = getObjectUniqueId(jobObject);
@@ -833,7 +1025,8 @@ public class SchedulerPlugin extends XWikiDefaultPlugin implements EventListener
      */
     public Date getPreviousFireTime(BaseObject object, XWikiContext context) throws SchedulerPluginException
     {
-        if (!isEnabled()) {
+        // Unknown when the scheduler runs on another cluster member
+        if (!isEnabled() || !isRunning()) {
             return null;
         }
 
@@ -852,7 +1045,26 @@ public class SchedulerPlugin extends XWikiDefaultPlugin implements EventListener
             return null;
         }
 
+        if (!isRunning()) {
+            // The scheduler runs on another cluster member (or is not started yet): compute the date from the job
+            // page
+            return getStoredNextFireTime(object);
+        }
+
         return getTrigger(object).getNextFireTime();
+    }
+
+    private Date getStoredNextFireTime(BaseObject object)
+    {
+        if (JobState.STATE_NORMAL.equals(object.getStringValue(STATUS))) {
+            try {
+                return new CronExpression(object.getStringValue(CRON)).getNextValidTimeAfter(new Date());
+            } catch (ParseException e) {
+                LOGGER.debug("Invalid cron expression for job [{}]", object.getReference(), e);
+            }
+        }
+
+        return null;
     }
 
     @Override
@@ -915,6 +1127,27 @@ public class SchedulerPlugin extends XWikiDefaultPlugin implements EventListener
             throw new SchedulerPluginException(
                 SchedulerPluginException.ERROR_SCHEDULERPLUGIN_INITIALIZE_STATUS_LISTENER,
                 "Error while initializing the status listener", e);
+        }
+    }
+
+    /**
+     * Save the status of a job scheduled from an instance where the scheduler is not running, and the context of
+     * its execution (see {@link #fillJobContext(BaseObject, XWikiContext)}), in a single save.
+     */
+    private void saveScheduledJob(BaseObject object, String status, XWikiContext context) throws XWikiException
+    {
+        // Avoid modifying the cache document
+        XWikiDocument jobHolder = context.getWiki().getDocument(object.getDocumentReference(), context).clone();
+
+        BaseObject job = jobHolder.getXObject(XWIKI_JOB_CLASSREFERENCE);
+        boolean jobUpdated = fillJobContext(job, context);
+        if (!status.equals(job.getStringValue(STATUS))) {
+            job.setStringValue(STATUS, status);
+            jobUpdated = true;
+        }
+
+        if (jobUpdated) {
+            context.getWiki().saveDocument(jobHolder, "", true, context);
         }
     }
 
@@ -984,6 +1217,10 @@ public class SchedulerPlugin extends XWikiDefaultPlugin implements EventListener
 
     private void onWikiDeletedEvent(String wikiId) throws SchedulerException
     {
+        if (!isRunning()) {
+            return;
+        }
+
         Set<JobKey> keys = getScheduler().getJobKeys(GroupMatcher.anyJobGroup());
 
         String idPrefix = getWikiIdPrefix(wikiId);
@@ -1007,6 +1244,12 @@ public class SchedulerPlugin extends XWikiDefaultPlugin implements EventListener
 
     private void onDocumentEvent(Object source, Object data)
     {
+        if (!isRunning()) {
+            // The instance running the scheduler takes care of the change (or the jobs are restored when the
+            // scheduler starts)
+            return;
+        }
+
         XWikiContext xcontext = (XWikiContext) data;
         XWikiDocument document = (XWikiDocument) source;
         XWikiDocument originalDocument = document.getOriginalDocument();
@@ -1037,7 +1280,49 @@ public class SchedulerPlugin extends XWikiDefaultPlugin implements EventListener
                     LOGGER.warn("Failed to register job in document [{}]: [{}]", document.getDocumentReference(),
                         ExceptionUtils.getRootCauseMessage(e));
                 }
+            } else {
+                boolean cronChanged =
+                    !Objects.equals(originalJobObj.getStringValue(CRON), jobObj.getStringValue(CRON));
+                if (cronChanged
+                    || !Objects.equals(originalJobObj.getStringValue(STATUS), jobObj.getStringValue(STATUS))) {
+                    // Status or schedule modified, for example from a cluster member where the scheduler is not
+                    // running
+                    try {
+                        BaseObject jobObject = getModifiableObject(document.getDocumentReference(), xcontext);
+
+                        applyStoredState(jobObject, cronChanged, xcontext);
+                    } catch (Exception e) {
+                        LOGGER.warn("Failed to update job in document [{}]: [{}]", document.getDocumentReference(),
+                            ExceptionUtils.getRootCauseMessage(e));
+                    }
+                }
             }
         }
+    }
+
+    /**
+     * Put the job in the scheduler in the state stored in its page, without saving the page. When the state differs,
+     * the job is rebuilt from the page, as at startup, so that it runs with the context and the rights of its last
+     * author.
+     *
+     * @param object the job object, as stored
+     * @param cronChanged true if the cron expression of the job changed
+     * @param context the XWiki context
+     */
+    private void applyStoredState(BaseObject object, boolean cronChanged, XWikiContext context)
+        throws SchedulerPluginException
+    {
+        TriggerState state = getCurrentJobState(object).getQuartzState();
+        if (!cronChanged && state == getStoredJobState(object).getQuartzState()) {
+            // Already applied, for example by the action which saved the page on this instance
+            return;
+        }
+
+        if (state != TriggerState.NONE) {
+            unregister(object);
+        }
+
+        // Only schedules a job whose stored status is Normal or Paused
+        register(object, context);
     }
 }
