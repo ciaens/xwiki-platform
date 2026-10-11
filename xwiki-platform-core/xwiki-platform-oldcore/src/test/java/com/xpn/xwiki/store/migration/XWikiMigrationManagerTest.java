@@ -41,6 +41,8 @@ import com.xpn.xwiki.test.junit5.mockito.InjectMockitoOldcore;
 import com.xpn.xwiki.test.junit5.mockito.OldcoreTest;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 
 /**
  * Test for {@link AbstractDataMigrationManager}.
@@ -65,6 +67,8 @@ class XWikiMigrationManagerTest
     @Singleton
     public static class TestDataMigrationManager extends AbstractDataMigrationManager
     {
+        Boolean migratingDuringMigration;
+
         private DataMigration createMigrator(final int ver)
         {
             return new DataMigration()
@@ -96,7 +100,8 @@ class XWikiMigrationManagerTest
                 @Override
                 public void migrate()
                 {
-                    // Nothing to do, this test migration does not change anything.
+                    // Remember if the manager reported the migration while it was running
+                    TestDataMigrationManager.this.migratingDuringMigration = isMigrating();
                 }
             };
         }
@@ -181,6 +186,24 @@ class XWikiMigrationManagerTest
         neededMigration.toArray(actual);
         assertEquals(234, actual[0].dataMigration.getVersion().getVersion());
         assertEquals(456, actual[1].dataMigration.getVersion().getVersion());
+    }
+
+    @Test
+    void isMigrating() throws Exception
+    {
+        this.oldCore.getSpyXWiki().getConfig().setProperty("xwiki.store.migration", "1");
+        this.oldCore.getSpyXWiki().getConfig().setProperty("xwiki.store.migration.version", "123");
+        TestDataMigrationManager mm =
+            this.componentManager.getInstance(DataMigrationManager.class, "TestDataMigration");
+
+        assertFalse(mm.isMigrating());
+        assertNull(mm.migratingDuringMigration);
+
+        mm.checkDatabase();
+
+        assertEquals(Boolean.TRUE, mm.migratingDuringMigration);
+        assertFalse(mm.isMigrating());
+        assertEquals(456, mm.curversion.getVersion());
     }
 
     @Component(staticRegistration = false)

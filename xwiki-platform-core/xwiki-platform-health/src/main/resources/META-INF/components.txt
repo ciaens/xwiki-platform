@@ -1,0 +1,2 @@
+org.xwiki.health.internal.XWikiInitializationReadinessIndicator
+org.xwiki.health.internal.XWikiInitializerStartupListener

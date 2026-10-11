@@ -20,6 +20,7 @@
 package com.xpn.xwiki.store.migration;
 
 import org.xwiki.component.annotation.Role;
+import org.xwiki.stability.Unstable;
 
 /**
  * Interface for all migration managers.
@@ -72,4 +73,15 @@ public interface DataMigrationManager
      * @since 3.4M1
      */
     void initNewDB() throws DataMigrationException;
+
+    /**
+     * @return true while the schema updates and data migrations started by {@link #checkDatabase()} are running, so
+     *         that the initialization progress can be reported without waiting for it to end
+     * @since 18.9.0RC1
+     */
+    @Unstable
+    default boolean isMigrating()
+    {
+        return false;
+    }
 }
