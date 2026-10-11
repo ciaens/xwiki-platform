@@ -99,6 +99,18 @@ public interface SolrConfiguration
     int getIndexerQueueCapacity();
 
     /**
+     * When XWiki stops, the indexer processes the entries which are still in its queues before stopping, within this
+     * time budget: one deadline covers the whole drain (resolving, indexing and the last requests to the Solr server).
+     * When it expires, the entries left are dropped (and logged) and nothing more is waited for, so this step of the
+     * shutdown never takes longer than the budget.
+     *
+     * @return the time budget in milliseconds of the indexer to process its queues when XWiki stops, {@code 5000} by
+     *         default; {@code 0} drops the queued entries immediately
+     * @since 18.9.0RC1
+     */
+    long getIndexerShutdownTimeout();
+
+    /**
      * @return true if a full synchronization job between the database and SOLR index should be run when XWiki starts
      * @since 6.1M2
      */
