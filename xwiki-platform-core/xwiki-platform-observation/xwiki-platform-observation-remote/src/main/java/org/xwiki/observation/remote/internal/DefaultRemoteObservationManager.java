@@ -112,6 +112,13 @@ public class DefaultRemoteObservationManager implements RemoteObservationManager
      */
     private NetworkAdapter networkAdapter;
 
+    /**
+     * Indicate that the application is stopping: the channels stay open so that the events produced by the shutdown
+     * are still sent, but the events received from the network are not injected anymore (the components supposed to
+     * handle them are being disposed).
+     */
+    private volatile boolean stopping;
+
     @Override
     public void initialize() throws InitializationException
     {
@@ -150,17 +157,22 @@ public class DefaultRemoteObservationManager implements RemoteObservationManager
         }
 
         if (localEvent.getEvent() instanceof ApplicationStoppedEvent) {
-            try {
-                this.networkAdapter.stopAllChannels();
-            } catch (RemoteEventException e) {
-                this.logger.error("Failed to stop channels", e);
-            }
+            // Stop injecting the events received from the network. The channels themselves are closed by the network
+            // adapter when it's disposed, after the other components had a chance to send their last events.
+            this.stopping = true;
         }
     }
 
     @Override
     public void notify(RemoteEventData remoteEvent)
     {
+        if (this.stopping) {
+            this.logger.debug("Ignoring the remote event [{}] since the application is stopping",
+                remoteEvent.getEvent());
+
+            return;
+        }
+
         // Make sure the Execution context is properly initialized
         initializeContext();
 
