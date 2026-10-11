@@ -569,6 +569,17 @@ rendering.transformations = $xwikiRenderingTransformations
 #-# The default is:
 #-# observation.remote.networkadapter = jgroups
 
+#-# [Since 18.9.0RC1]
+#-# The priority of this instance when the members of the cluster elect the one which runs the tasks executed only once
+#-# in the cluster (for example the synchronization of a remote Solr index at startup). The member with the highest
+#-# priority is elected and, when several members have the highest priority, the oldest member of the cluster is
+#-# elected. A negative value means this instance is never elected. A typical setup gives a higher priority to a member
+#-# dedicated to background tasks (for example 10), the other members (0) taking over only while it is not part of the
+#-# cluster. The value must be an integer and is shared with the other members when this instance joins the cluster.
+#-#
+#-# The default is:
+# observation.remote.singletonPriority = 0
+
 #-------------------------------------------------------------------------------------
 # CSRF token component
 #-------------------------------------------------------------------------------------
@@ -898,6 +909,10 @@ distribution.automaticStartOnWiki=$xwikiPropertiesAutomaticStartOnWiki
 #-# Indicates if a synchronization between SOLR index and XWiki database should be performed at startup.
 #-# Synchronization can be started from the search administration UI.
 #-# The default is true.
+#-# [Since 18.9.0RC1] With a remote Solr server (solr.type=remote) in a cluster, the synchronization runs only on the
+#-# cluster singleton node (see observation.remote.singletonPriority): once for the full farm when it starts, and again
+#-# when another member becomes the singleton node (see solr.synchronizeOnSingletonGainDelay). Setting this property to
+#-# false still disables the synchronization on the member where it is set.
 # solr.synchronizeAtStartup=false
 
 #-# [Since 12.5RC1]
@@ -907,8 +922,21 @@ distribution.automaticStartOnWiki=$xwikiPropertiesAutomaticStartOnWiki
 #-#   - FARM: indicate that the synchronization is performed once for the full farm when XWiki is started.
 #-# For large farms and in order to spread the machine's indexing load, the WIKI value is recommended, especially if
 #-# some wikis are not used.
+#-# [Since 18.9.0RC1] With a remote Solr server (solr.type=remote) in a cluster, the synchronization is always
+#-# performed once for the full farm by the cluster singleton node (a member serving no request may never access the
+#-# subwikis), whatever this property says.
 #-# The default is:
 # solr.synchronizeAtStartupMode=FARM
+
+#-# [Since 18.9.0RC1]
+#-# With a remote Solr server (solr.type=remote) in a cluster, the number of seconds a member which becomes the cluster
+#-# singleton node waits before synchronizing the index (the previous singleton node may have stopped before or while
+#-# synchronizing it). Nothing is done if the member is not the singleton node anymore when the delay expires, so a
+#-# short restart of the preferred member (for example a member dedicated to background tasks with a higher
+#-# observation.remote.singletonPriority) does not trigger a synchronization on another member. 0 synchronizes
+#-# immediately.
+#-# The default is:
+# solr.synchronizeOnSingletonGainDelay=60
 
 #-# [Since 17.2.0RC1]
 #-# [Since 16.10.5]

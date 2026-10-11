@@ -23,14 +23,14 @@ import org.xwiki.observation.event.Event;
 import org.xwiki.stability.Unstable;
 
 /**
- * This event is triggered when the leader of of {@link NetworkChannel} changes (generally because the previous leader
+ * This event is triggered when the leader of a {@link NetworkChannel} changes (generally because the previous leader
  * left the cluster).
  * <p>
  * The event also send the following parameters:
  * </p>
  * <ul>
  * <li>source: the {@link NetworkChannel}</li>
- * <li>data: the previous leader as a {@link NetworkMember}</li>
+ * <li>data: the new leader as a {@link NetworkMember}</li>
  * </ul>
  * 
  * @version $Id$
