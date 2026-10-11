@@ -173,7 +173,7 @@ $services.template.execute('logging_macros.vm')
     #if (!$finished)
       #displayJobProgressBar($jobStatus)
     #else
-      #jobFinishedMessage($status, $translationPrefix)
+      #jobFinishedMessage($jobStatus, $translationPrefix)
     #end
     #if ($showLogs || $isAdvancedUser || $isSuperAdmin)
       #displayJobStatusLog($jobStatus true)
