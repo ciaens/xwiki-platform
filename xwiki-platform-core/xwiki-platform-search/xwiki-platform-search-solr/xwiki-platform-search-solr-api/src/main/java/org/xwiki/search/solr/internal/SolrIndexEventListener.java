@@ -23,10 +23,10 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.Locale;
 
-import javax.inject.Inject;
-import javax.inject.Named;
-import javax.inject.Provider;
-import javax.inject.Singleton;
+import jakarta.inject.Inject;
+import jakarta.inject.Named;
+import jakarta.inject.Provider;
+import jakarta.inject.Singleton;
 
 import org.apache.commons.lang3.exception.ExceptionUtils;
 import org.slf4j.Logger;
@@ -40,6 +40,8 @@ import org.xwiki.model.reference.DocumentReference;
 import org.xwiki.model.reference.WikiReference;
 import org.xwiki.observation.EventListener;
 import org.xwiki.observation.event.Event;
+import org.xwiki.observation.remote.RemoteObservationManagerContext;
+import org.xwiki.search.solr.internal.api.SolrConfiguration;
 import org.xwiki.search.solr.internal.api.SolrIndexer;
 
 import com.xpn.xwiki.XWikiContext;
@@ -92,6 +94,18 @@ public class SolrIndexEventListener implements EventListener
     @Inject
     private Provider<SolrIndexer> solrIndexer;
 
+    /**
+     * Used to know if the event comes from another cluster member.
+     */
+    @Inject
+    private RemoteObservationManagerContext remoteObservationManagerContext;
+
+    /**
+     * Used to know if the Solr server is shared by all the cluster members.
+     */
+    @Inject
+    private SolrConfiguration solrConfiguration;
+
     @Override
     public List<Event> getEvents()
     {
@@ -107,6 +121,13 @@ public class SolrIndexEventListener implements EventListener
     @Override
     public void onEvent(Event event, Object source, Object data)
     {
+        // A Solr index shared by all the cluster members is updated only by the member where the change happened:
+        // doing it on each member only sends redundant (and possibly out of order) updates for the same entities and
+        // multiplies the indexing work by the number of members. The configuration is read only for remote events.
+        if (this.remoteObservationManagerContext.isRemoteState() && this.solrConfiguration.isIndexShared()) {
+            return;
+        }
+
         try {
             if (event instanceof DocumentUpdatedEvent) {
                 XWikiDocument document = (XWikiDocument) source;
