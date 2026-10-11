@@ -3,6 +3,7 @@ org.xwiki.extension.distribution.internal.DistributionAction
 org.xwiki.extension.distribution.internal.DistributionConfiguration
 org.xwiki.extension.distribution.internal.DistributionInitializerListener
 org.xwiki.extension.distribution.internal.DistributionInternalScriptService
+org.xwiki.extension.distribution.internal.DistributionReadinessIndicator
 org.xwiki.extension.distribution.internal.DocumentsModifiedDuringDistributionListener
 org.xwiki.extension.distribution.internal.WikiDistributionWikiEventListener
 org.xwiki.extension.distribution.internal.job.DefaultDistributionJob

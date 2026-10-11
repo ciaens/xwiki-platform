@@ -313,6 +313,18 @@
     -->
   </servlet>
 
+  <!-- Health endpoint for load balancers and orchestrators (e.g. Kubernetes probes), mapped on two paths:
+       * /health (readiness) reports the initialization state: 200 when ready, 503 otherwise;
+       * /health/live (liveness) answers 200 as soon as the web application runs.
+       It never triggers nor waits for the XWiki initialization, which is why it's a plain Servlet and is not behind
+       the XWiki context initialization filters. The details of the checks are only exposed when
+       container.health.details is enabled in xwiki.properties; the endpoint is not meant to be exposed publicly. -->
+  <servlet>
+    <servlet-name>health</servlet-name>
+    <servlet-class>org.xwiki.container.servlet.HealthServlet</servlet-class>
+    <load-on-startup>1</load-on-startup>
+  </servlet>
+
   <!-- REST Service -->
   <servlet>
     <servlet-name>RESTServlet</servlet-name>
@@ -349,6 +361,12 @@
   <servlet-mapping>
     <servlet-name>redirectHomeServlet</servlet-name>
     <url-pattern>/redirect</url-pattern>
+  </servlet-mapping>
+
+  <servlet-mapping>
+    <servlet-name>health</servlet-name>
+    <url-pattern>/health</url-pattern>
+    <url-pattern>/health/live</url-pattern>
   </servlet-mapping>
 
   <!-- We override the mime type definition for javascript and css files, as some containers don't
