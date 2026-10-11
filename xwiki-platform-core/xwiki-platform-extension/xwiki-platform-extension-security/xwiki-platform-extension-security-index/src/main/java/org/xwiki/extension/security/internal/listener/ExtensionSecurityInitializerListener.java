@@ -27,9 +27,10 @@ import javax.inject.Provider;
 import javax.inject.Singleton;
 
 import org.xwiki.component.annotation.Component;
+import org.xwiki.extension.index.internal.ExtensionIndexClusterConfiguration;
 import org.xwiki.extension.security.internal.ExtensionSecurityScheduler;
 import org.xwiki.job.event.JobFinishedEvent;
-import org.xwiki.observation.event.AbstractLocalEventListener;
+import org.xwiki.observation.event.AbstractClusterSingletonListener;
 import org.xwiki.observation.event.Event;
 
 import static org.xwiki.extension.index.internal.job.ExtensionIndexJob.JOB_TYPE;
@@ -37,6 +38,12 @@ import static org.xwiki.extension.index.internal.job.ExtensionIndexJob.JOB_TYPE;
 /**
  * Starts the {@link ExtensionSecurityScheduler} in charge of fetching known security vulnerabilities for installed
  * extensions once the extension indexing is done.
+ * <p>
+ * When the extension index is shared by the members of the cluster (see
+ * {@link ExtensionIndexClusterConfiguration#isSingletonNodeRequired()}), the scheduler runs only on the cluster
+ * singleton node: it's started when an extension indexing job finishes on the singleton node (including the indexing
+ * started when the current instance becomes the singleton node), and it's stopped when the current instance stops
+ * being the singleton node. Otherwise each instance scans its own index.
  *
  * @version $Id$
  * @since 15.5RC1
@@ -44,7 +51,7 @@ import static org.xwiki.extension.index.internal.job.ExtensionIndexJob.JOB_TYPE;
 @Component
 @Named(ExtensionSecurityInitializerListener.NAME)
 @Singleton
-public class ExtensionSecurityInitializerListener extends AbstractLocalEventListener
+public class ExtensionSecurityInitializerListener extends AbstractClusterSingletonListener
 {
     /**
      * The name of the event listener (and its component hint).
@@ -53,6 +60,9 @@ public class ExtensionSecurityInitializerListener extends AbstractLocalEventList
 
     @Inject
     private Provider<ExtensionSecurityScheduler> schedulerProvider;
+
+    @Inject
+    private ExtensionIndexClusterConfiguration clusterConfiguration;
 
     /**
      * Default constructor.
@@ -63,14 +73,31 @@ public class ExtensionSecurityInitializerListener extends AbstractLocalEventList
     }
 
     @Override
-    public void processLocalEvent(Event event, Object source, Object data)
+    protected boolean isSingletonNodeRequired()
     {
-        // Clustering related note: since the JobFinishedEvent is only sent by node, the scheduler will also be stared 
-        // on a single node. Therefore 
-        if (event instanceof JobFinishedEvent jobFinishedEvent
-            && Objects.equals(jobFinishedEvent.getJobType(), JOB_TYPE))
-        {
+        return this.clusterConfiguration.isSingletonNodeRequired();
+    }
+
+    @Override
+    protected void processSingletonEvent(Event event, Object source, Object data)
+    {
+        // The remote events are also received when the singleton node is not required
+        if (isLocalIndexJobFinished(event)) {
             this.schedulerProvider.get().start();
         }
+    }
+
+    @Override
+    protected void onSingletonNodeLost()
+    {
+        // A running scan is not interrupted
+        this.schedulerProvider.get().stop();
+    }
+
+    private boolean isLocalIndexJobFinished(Event event)
+    {
+        return event instanceof JobFinishedEvent jobFinishedEvent
+            && Objects.equals(jobFinishedEvent.getJobType(), JOB_TYPE)
+            && !this.remoteObservationManagerContext.isRemoteState();
     }
 }

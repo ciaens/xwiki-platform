@@ -20,9 +20,13 @@
 package org.xwiki.extension.index.internal.job;
 
 import java.util.Arrays;
+import java.util.Collection;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 
 import javax.inject.Inject;
@@ -31,8 +35,10 @@ import javax.inject.Singleton;
 import org.slf4j.Logger;
 import org.xwiki.component.annotation.Component;
 import org.xwiki.component.manager.ComponentLifecycleException;
+import org.xwiki.component.manager.ComponentManager;
 import org.xwiki.component.namespace.Namespace;
 import org.xwiki.component.phase.Disposable;
+import org.xwiki.context.concurrent.ExecutionContextRunnable;
 import org.xwiki.extension.ExtensionManagerConfiguration;
 import org.xwiki.extension.index.ExtensionIndexStatus;
 import org.xwiki.job.Job;
@@ -42,6 +48,7 @@ import org.xwiki.job.JobStatusStore;
 import org.xwiki.job.event.status.JobStatus.State;
 import org.xwiki.model.namespace.WikiNamespace;
 import org.xwiki.wiki.descriptor.WikiDescriptorManager;
+import org.xwiki.wiki.manager.WikiManagerException;
 
 /**
  * Component in charge of scheduling and stopping indexing jobs.
@@ -66,6 +73,9 @@ public class ExtensionIndexJobScheduler implements Disposable
     private WikiDescriptorManager wikis;
 
     @Inject
+    private ComponentManager componentManager;
+
+    @Inject
     private Logger logger;
 
     private ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
@@ -80,15 +90,75 @@ public class ExtensionIndexJobScheduler implements Disposable
     private volatile boolean disposed;
 
     /**
-     * Indicate that the instance is starting.
+     * Guards {@link #started}, {@link #firstJobPending}, {@link #periodicTask} and the changes of the namespaces of
+     * {@link #scheduledRequest}.
      */
-    public void start()
-    {
-        // Add main wiki
-        this.scheduledRequest.addNamespace(new WikiNamespace(this.wikis.getMainWikiId()));
+    private final Object schedulingLock = new Object();
 
-        // Trigger a first indexing
-        executeFirstJob();
+    /**
+     * {@code true} between {@link #start(boolean)} and {@link #stop()}.
+     */
+    private boolean started;
+
+    /**
+     * {@code true} while the job which starts the periodic indexing is queued or running.
+     */
+    private boolean firstJobPending;
+
+    private ScheduledFuture<?> periodicTask;
+
+    private volatile boolean allWikis;
+
+    /**
+     * Start indexing the extensions right away and then periodically. Calling this method while the indexing is
+     * already started has no effect (a running job keeps running and the periodic indexing is not scheduled twice).
+     *
+     * @param allWikis {@code true} to index the extensions of all the wikis, including the wikis which are not ready
+     *            on this instance (the wikis of the scheduled indexing are replaced by the current list of wikis before
+     *            each run, so created wikis are added and deleted wikis are forgotten), {@code false} to index the
+     *            extensions of the main wiki and of the namespaces passed to {@link #initialize(Namespace)}
+     * @since 18.10.0RC1
+     */
+    public void start(boolean allWikis)
+    {
+        if (allWikis) {
+            this.allWikis = true;
+        }
+
+        // Add main wiki
+        addScheduledNamespace(new WikiNamespace(this.wikis.getMainWikiId()));
+
+        synchronized (this.schedulingLock) {
+            if (!this.started) {
+                this.started = true;
+
+                if (this.periodicTask == null && !this.firstJobPending) {
+                    this.firstJobPending = true;
+
+                    // Trigger a first indexing
+                    executeFirstJob();
+                }
+            }
+        }
+    }
+
+    /**
+     * Stop the periodic indexing, for example because another member of the cluster is now in charge of it. A running
+     * indexing job is not interrupted. The indexing can be started again with {@link #start(boolean)}.
+     *
+     * @since 18.10.0RC1
+     */
+    public void stop()
+    {
+        synchronized (this.schedulingLock) {
+            this.started = false;
+
+            if (this.periodicTask != null) {
+                // Don't interrupt the running job
+                this.periodicTask.cancel(false);
+                this.periodicTask = null;
+            }
+        }
     }
 
     /**
@@ -98,7 +168,7 @@ public class ExtensionIndexJobScheduler implements Disposable
      */
     public void initialize(Namespace namespace)
     {
-        this.scheduledRequest.addNamespace(namespace);
+        addScheduledNamespace(namespace);
 
         // Start an analysis of the namespace only if something changed
         if (this.extensionAdded) {
@@ -185,7 +255,7 @@ public class ExtensionIndexJobScheduler implements Disposable
     public void add(Namespace namespace)
     {
         // Update the scheduled request
-        this.scheduledRequest.addNamespace(namespace);
+        addScheduledNamespace(namespace);
 
         // Queue an analysis of the namespace
         executeJob(new ExtensionIndexRequest(false, false, Arrays.asList(namespace)));
@@ -197,39 +267,111 @@ public class ExtensionIndexJobScheduler implements Disposable
     public void remove(Namespace namespace)
     {
         // Update the scheduled request
-        this.scheduledRequest.removeNamespace(namespace);
+        synchronized (this.schedulingLock) {
+            this.scheduledRequest.removeNamespace(namespace);
+        }
 
         // TODO: remove the namespace from the index
     }
 
     private void executeFirstJob()
     {
-        this.scheduler.execute(this::runFirstJob);
+        this.scheduler.execute(withContext(this::runFirstJob));
     }
 
     private void executeJob(ExtensionIndexRequest request)
     {
-        this.scheduler.execute(() -> this.runJob(request));
+        this.scheduler.execute(withContext(() -> this.runJob(request)));
+    }
+
+    /**
+     * The tasks need an execution context, for example to list the wikis.
+     */
+    private Runnable withContext(Runnable runnable)
+    {
+        return new ExecutionContextRunnable(runnable, this.componentManager);
     }
 
     private void runFirstJob()
     {
-        // Run the first job
-        runScheduledJob();
+        try {
+            // The indexing might have been stopped while this job was queued
+            if (isStarted()) {
+                // Run the first job
+                runScheduledJob();
 
-        if (!this.disposed) {
-            // Disable local extension loading (it will be done dynamically)
-            this.scheduledRequest.setLocalExtensionsEnabled(false);
+                if (!this.disposed) {
+                    // Disable local extension loading (it will be done dynamically)
+                    this.scheduledRequest.setLocalExtensionsEnabled(false);
+                }
+            }
+        } finally {
+            synchronized (this.schedulingLock) {
+                this.firstJobPending = false;
 
-            // Start scheduling following jobs
-            this.scheduler.scheduleWithFixedDelay(this::runScheduledJob, this.configuration.getIndexInterval(),
-                this.configuration.getIndexInterval(), TimeUnit.SECONDS);
+                if (this.started && !this.disposed && this.periodicTask == null) {
+                    // Start scheduling following jobs
+                    this.periodicTask = this.scheduler.scheduleWithFixedDelay(withContext(this::runScheduledJob),
+                        this.configuration.getIndexInterval(), this.configuration.getIndexInterval(), TimeUnit.SECONDS);
+                }
+            }
+        }
+    }
+
+    private boolean isStarted()
+    {
+        synchronized (this.schedulingLock) {
+            return this.started;
+        }
+    }
+
+    private void addScheduledNamespace(Namespace namespace)
+    {
+        synchronized (this.schedulingLock) {
+            if (!this.scheduledRequest.getNamespaces().contains(namespace)) {
+                this.scheduledRequest.addNamespace(namespace);
+            }
+        }
+    }
+
+    private void updateWikis()
+    {
+        Collection<String> wikiIds;
+        try {
+            wikiIds = this.wikis.getAllIds();
+        } catch (WikiManagerException e) {
+            this.logger.error("Failed to get the list of wikis, the extensions are indexed for the previous list", e);
+
+            return;
+        }
+
+        synchronized (this.schedulingLock) {
+            Set<Namespace> currentWikis = new HashSet<>();
+            for (String wikiId : wikiIds) {
+                currentWikis.add(new WikiNamespace(wikiId));
+            }
+
+            // Forget the deleted wikis
+            for (Namespace namespace : this.scheduledRequest.getNamespaces()) {
+                if (WikiNamespace.TYPE.equals(namespace.getType()) && !currentWikis.contains(namespace)) {
+                    this.scheduledRequest.removeNamespace(namespace);
+                }
+            }
+
+            // Add the new wikis
+            for (String wikiId : wikiIds) {
+                addScheduledNamespace(new WikiNamespace(wikiId));
+            }
         }
     }
 
     private void runScheduledJob()
     {
         if (!this.disposed) {
+            if (this.allWikis) {
+                updateWikis();
+            }
+
             Job job = runJob(this.scheduledRequest);
 
             if (job != null) {

@@ -19,6 +19,8 @@
  */
 package org.xwiki.extension.security.internal;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -62,6 +64,11 @@ public class ExtensionSecurityScheduler implements Runnable, Disposable
     private CompletableFuture<Boolean> completableFuture;
 
     /**
+     * The executors stopped by {@link #stop()}, whose running scan is interrupted when the component is disposed.
+     */
+    private final List<ScheduledExecutorService> stoppedExecutors = new ArrayList<>();
+
+    /**
      * Initialize and start the scheduler.
      *
      * @return a completable future set to {@code true} once a first job is done and the security scan is enabled, or
@@ -81,9 +88,12 @@ public class ExtensionSecurityScheduler implements Runnable, Disposable
                 return thread;
             });
 
-            // Create the future before scheduling so run() can always complete it.
-            this.completableFuture = new CompletableFuture<>();
-            this.executor.scheduleWithFixedDelay(this, 0, this.extensionSecurityConfiguration.getScanDelay(), HOURS);
+            // Create the future before scheduling so the scan can always complete it, and give it to the scan so that a
+            // scan of a stopped executor does not complete the future of the next start.
+            CompletableFuture<Boolean> future = new CompletableFuture<>();
+            this.completableFuture = future;
+            this.executor.scheduleWithFixedDelay(() -> scan(future), 0,
+                this.extensionSecurityConfiguration.getScanDelay(), HOURS);
         }
         return this.completableFuture;
     }
@@ -107,12 +117,36 @@ public class ExtensionSecurityScheduler implements Runnable, Disposable
         return start();
     }
 
+    /**
+     * Stop the periodic scan, for example because another member of the cluster is now in charge of it. A running scan
+     * is not interrupted. The scan can be started again with {@link #start()}.
+     *
+     * @since 18.10.0RC1
+     */
+    public synchronized void stop()
+    {
+        this.started = false;
+
+        if (this.executor != null) {
+            // Cancel the next scans without interrupting the running one
+            this.executor.shutdown();
+            this.stoppedExecutors.removeIf(ScheduledExecutorService::isTerminated);
+            this.stoppedExecutors.add(this.executor);
+            this.executor = null;
+        }
+    }
+
     @Override
     public void run()
     {
+        scan(this.completableFuture);
+    }
+
+    private void scan(CompletableFuture<Boolean> future)
+    {
         if (!this.extensionSecurityConfiguration.isSecurityScanEnabled()) {
             this.logger.info("Extension security scan disabled.");
-            this.completableFuture.complete(false);
+            future.complete(false);
             return;
         }
 
@@ -128,14 +162,15 @@ public class ExtensionSecurityScheduler implements Runnable, Disposable
         } catch (Exception e) {
             this.logger.error("Failed to execute job", e);
         }
-        this.completableFuture.complete(true);
+        future.complete(true);
     }
 
     @Override
-    public void dispose()
+    public synchronized void dispose()
     {
         if (this.executor != null) {
             this.executor.shutdownNow();
         }
+        this.stoppedExecutors.forEach(ScheduledExecutorService::shutdownNow);
     }
 }
