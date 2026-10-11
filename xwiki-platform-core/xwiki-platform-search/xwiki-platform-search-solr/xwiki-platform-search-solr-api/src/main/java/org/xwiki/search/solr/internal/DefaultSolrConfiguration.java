@@ -196,6 +196,12 @@ public class DefaultSolrConfiguration implements SolrConfiguration
     }
 
     @Override
+    public boolean isIndexShared()
+    {
+        return SOLR_REMOTE_TYPE.equals(getServerType());
+    }
+
+    @Override
     public <T> T getInstanceConfiguration(String instanceType, String propertyName, T defaultValue)
     {
         String actualPropertyName = String.format("%s.%s.%s", "solr", instanceType, propertyName);
