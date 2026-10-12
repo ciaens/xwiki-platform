@@ -28,6 +28,7 @@ import javax.inject.Singleton;
 
 import org.apache.commons.lang3.StringUtils;
 import org.hibernate.Session;
+import org.hibernate.query.Query;
 import org.xwiki.component.annotation.Component;
 import org.xwiki.context.ExecutionContext;
 import org.xwiki.context.ExecutionContextManager;
@@ -55,6 +56,12 @@ public class TasksStore extends XWikiHibernateBaseStore
 
     private static final String TYPE = "type";
 
+    private static final String INSTANCE_ID = "instanceId";
+
+    private static final String OLDEST = "oldest";
+
+    private static final String OLDEST_CONDITION = " and t.timestamp >= :oldest";
+
     @Inject
     private ExecutionContextManager contextManager;
 
@@ -75,8 +82,92 @@ public class TasksStore extends XWikiHibernateBaseStore
         return initWikiContext(xWikiContext -> executeRead(xWikiContext,
             session -> session.createQuery("SELECT t FROM XWikiDocumentIndexingTask t "
                     + "WHERE t.instanceId = :instanceId")
-                .setParameter("instanceId", instanceId)
+                .setParameter(INSTANCE_ID, instanceId)
                 .getResultList()), wikiId);
+    }
+
+    /**
+     * Gives the identifiers of the cluster members which queued tasks in a given wiki, for example to find the tasks
+     * left by a cluster member which is gone for good.
+     *
+     * @param wikiId the wiki in which to execute the query
+     * @param excludedInstanceId the identifier of a cluster member to leave out of the result, generally the
+     *     identifier of the current instance
+     * @param oldest only the members with a task queued at or after this date are returned, {@code null} for no limit
+     * @return the distinct identifiers of the cluster members (other than the excluded one) with at least one task in
+     *     the wiki, the tasks without identifier are ignored
+     * @throws XWikiException in case of error when creating or executing the query
+     * @since 18.10.0RC1
+     */
+    public List<String> getInstanceIds(String wikiId, String excludedInstanceId, Date oldest) throws XWikiException
+    {
+        return initWikiContext(xWikiContext -> executeRead(xWikiContext, session -> {
+            StringBuilder statement = new StringBuilder("select distinct t.instanceId from XWikiDocumentIndexingTask t"
+                + " where t.instanceId is not null and t.instanceId <> :instanceId");
+            if (oldest != null) {
+                statement.append(OLDEST_CONDITION);
+            }
+            Query<String> query = session.createQuery(statement.toString(), String.class)
+                .setParameter(INSTANCE_ID, excludedInstanceId);
+            if (oldest != null) {
+                query.setParameter(OLDEST, oldest);
+            }
+            return query.getResultList();
+        }), wikiId);
+    }
+
+    /**
+     * Assigns to another cluster member the tasks queued by a cluster member in a given wiki during a period, for
+     * example to take over the tasks left by a cluster member which is gone for good. The change is done with a single
+     * update query, so each task is assigned to the new member once, and the member which queued the tasks does not
+     * load them anymore if it comes back.
+     *
+     * @param wikiId the wiki in which to execute the query
+     * @param instanceId the identifier of the cluster member which queued the tasks
+     * @param newInstanceId the identifier of the cluster member which takes over the tasks, generally the current
+     *     instance
+     * @param oldest only the tasks queued at or after this date are assigned, {@code null} for no limit
+     * @param newest only the tasks queued at or before this date are assigned
+     * @return the number of tasks assigned to the new cluster member
+     * @throws XWikiException in case of error when creating or executing the query
+     * @since 18.10.0RC1
+     */
+    public int reassignTasks(String wikiId, String instanceId, String newInstanceId, Date oldest, Date newest)
+        throws XWikiException
+    {
+        return initWikiContext(xWikiContext -> executeWrite(xWikiContext, session -> {
+            StringBuilder statement = new StringBuilder("update XWikiDocumentIndexingTask t"
+                + " set t.instanceId = :newInstanceId where t.instanceId = :instanceId and t.timestamp <= :newest");
+            if (oldest != null) {
+                statement.append(OLDEST_CONDITION);
+            }
+            Query<?> query = session.createQuery(statement.toString())
+                .setParameter("newInstanceId", newInstanceId)
+                .setParameter(INSTANCE_ID, instanceId)
+                .setParameter("newest", newest);
+            if (oldest != null) {
+                query.setParameter(OLDEST, oldest);
+            }
+            return query.executeUpdate();
+        }), wikiId);
+    }
+
+    /**
+     * Counts the tasks queued by a cluster member in a given wiki.
+     *
+     * @param wikiId the wiki in which to execute the query
+     * @param instanceId the identifier of the cluster member which queued the tasks
+     * @return the number of tasks of the cluster member in the wiki
+     * @throws XWikiException in case of error when creating or executing the query
+     * @since 18.10.0RC1
+     */
+    public long countTasks(String wikiId, String instanceId) throws XWikiException
+    {
+        return initWikiContext(xWikiContext -> executeRead(xWikiContext,
+            session -> session.createQuery(
+                    "select count(t) from XWikiDocumentIndexingTask t where t.instanceId = :instanceId", Long.class)
+                .setParameter(INSTANCE_ID, instanceId)
+                .getSingleResult()), wikiId);
     }
 
     /**

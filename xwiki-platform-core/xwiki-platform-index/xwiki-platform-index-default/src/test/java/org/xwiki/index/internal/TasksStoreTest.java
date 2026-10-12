@@ -19,6 +19,7 @@
  */
 package org.xwiki.index.internal;
 
+import java.util.Date;
 import java.util.List;
 
 import javax.inject.Named;
@@ -47,7 +48,9 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -88,6 +91,12 @@ class TasksStoreTest
     @Mock
     private Query query;
 
+    @Mock
+    private Query<String> stringQuery;
+
+    @Mock
+    private Query<Long> longQuery;
+
     @BeforeEach
     void setUp()
     {
@@ -96,6 +105,10 @@ class TasksStoreTest
         when(this.store.getCurrentSession()).thenReturn(this.session);
         when(this.session.createQuery(anyString())).thenReturn(this.query);
         when(this.query.setParameter(anyString(), any())).thenReturn(this.query);
+        when(this.session.createQuery(anyString(), eq(String.class))).thenReturn(this.stringQuery);
+        when(this.stringQuery.setParameter(anyString(), any())).thenReturn(this.stringQuery);
+        when(this.session.createQuery(anyString(), eq(Long.class))).thenReturn(this.longQuery);
+        when(this.longQuery.setParameter(anyString(), any())).thenReturn(this.longQuery);
     }
 
     @Test
@@ -224,5 +237,86 @@ class TasksStoreTest
         verify(this.session).createQuery("select doc from XWikiDocument doc where doc.id = :docId");
         verify(this.query).setParameter("docId", 42L);
         verify(this.query).getSingleResult();
+    }
+
+    @Test
+    void getInstanceIds() throws Exception
+    {
+        Date oldest = new Date();
+        when(this.stringQuery.getResultList()).thenReturn(List.of("xwiki-web-1", "xwiki-web-2"));
+
+        assertEquals(List.of("xwiki-web-1", "xwiki-web-2"), this.tasksStore.getInstanceIds("wikiId", "me", oldest));
+
+        verify(this.contextManager).initialize(any());
+        verify(this.context).setWikiId("wikiId");
+        verify(this.session).createQuery("select distinct t.instanceId from XWikiDocumentIndexingTask t"
+            + " where t.instanceId is not null and t.instanceId <> :instanceId and t.timestamp >= :oldest",
+            String.class);
+        verify(this.stringQuery).setParameter("instanceId", "me");
+        verify(this.stringQuery).setParameter("oldest", oldest);
+    }
+
+    @Test
+    void getInstanceIdsWithoutOldest() throws Exception
+    {
+        when(this.stringQuery.getResultList()).thenReturn(List.of("xwiki-web-1"));
+
+        assertEquals(List.of("xwiki-web-1"), this.tasksStore.getInstanceIds("wikiId", "me", null));
+
+        verify(this.session).createQuery("select distinct t.instanceId from XWikiDocumentIndexingTask t"
+            + " where t.instanceId is not null and t.instanceId <> :instanceId", String.class);
+        verify(this.stringQuery).setParameter("instanceId", "me");
+        verify(this.stringQuery, never()).setParameter(eq("oldest"), any());
+    }
+
+    @Test
+    void reassignTasks() throws Exception
+    {
+        Date oldest = new Date(1000);
+        Date newest = new Date(2000);
+        when(this.query.executeUpdate()).thenReturn(3);
+
+        assertEquals(3, this.tasksStore.reassignTasks("wikiId", "xwiki-web-1", "me", oldest, newest));
+
+        verify(this.contextManager).initialize(any());
+        verify(this.context).setWikiId("wikiId");
+        verify(this.session).createQuery("update XWikiDocumentIndexingTask t set t.instanceId = :newInstanceId"
+            + " where t.instanceId = :instanceId and t.timestamp <= :newest and t.timestamp >= :oldest");
+        verify(this.query).setParameter("newInstanceId", "me");
+        verify(this.query).setParameter("instanceId", "xwiki-web-1");
+        verify(this.query).setParameter("newest", newest);
+        verify(this.query).setParameter("oldest", oldest);
+        verify(this.query).executeUpdate();
+    }
+
+    @Test
+    void reassignTasksWithoutOldest() throws Exception
+    {
+        Date newest = new Date(2000);
+        when(this.query.executeUpdate()).thenReturn(0);
+
+        assertEquals(0, this.tasksStore.reassignTasks("wikiId", "xwiki-web-1", "me", null, newest));
+
+        verify(this.session).createQuery("update XWikiDocumentIndexingTask t set t.instanceId = :newInstanceId"
+            + " where t.instanceId = :instanceId and t.timestamp <= :newest");
+        verify(this.query).setParameter("newInstanceId", "me");
+        verify(this.query).setParameter("instanceId", "xwiki-web-1");
+        verify(this.query).setParameter("newest", newest);
+        verify(this.query, never()).setParameter(eq("oldest"), any());
+        verify(this.query).executeUpdate();
+    }
+
+    @Test
+    void countTasks() throws Exception
+    {
+        when(this.longQuery.getSingleResult()).thenReturn(5L);
+
+        assertEquals(5, this.tasksStore.countTasks("wikiId", "xwiki-web-1"));
+
+        verify(this.contextManager).initialize(any());
+        verify(this.context).setWikiId("wikiId");
+        verify(this.session).createQuery(
+            "select count(t) from XWikiDocumentIndexingTask t where t.instanceId = :instanceId", Long.class);
+        verify(this.longQuery).setParameter("instanceId", "xwiki-web-1");
     }
 }
