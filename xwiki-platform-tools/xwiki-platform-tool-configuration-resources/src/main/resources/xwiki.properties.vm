@@ -503,9 +503,10 @@ rendering.transformations = $xwikiRenderingTransformations
 #-# The identifier must stay the same when the instance is restarted (keep the permanent directory or set this
 #-# property): the events produced by the instance are associated with it, and a cluster member pre-filters the
 #-# events and resumes the pending live notification mails associated with its own identifier (the cluster singleton
-#-# node also handles the events without identifier). An identifier which has been absent from the cluster for
-#-# observation.remote.reclaimDelay is considered gone for good, and the cluster singleton node can then take over the
-#-# work which was left pending.
+#-# node also handles the events without identifier). The events of an identifier which disappeared (the events produced
+#-# up to observation.remote.reclaimMaxAge before it disappeared) are handled by the cluster singleton node once the
+#-# identifier has been absent for observation.remote.reclaimDelay: it is then considered gone for good, and the cluster
+#-# singleton node takes over the work which was left pending.
 #-# 
 # observation.remote.id = node1
 
