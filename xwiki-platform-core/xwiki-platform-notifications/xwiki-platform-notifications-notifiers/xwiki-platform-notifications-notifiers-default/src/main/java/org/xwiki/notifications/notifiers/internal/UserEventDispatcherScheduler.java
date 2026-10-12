@@ -25,6 +25,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Collectors;
 
 import javax.inject.Inject;
@@ -71,7 +72,10 @@ public class UserEventDispatcherScheduler implements Disposable
 
     private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
 
-    private volatile boolean running;
+    /**
+     * {@code true} when a run was requested and did not start yet: the following requests are merged into it.
+     */
+    private final AtomicBoolean pending = new AtomicBoolean();
 
     private volatile boolean initialized;
 
@@ -94,9 +98,9 @@ public class UserEventDispatcherScheduler implements Disposable
     public void onEvent(Event event)
     {
         try {
-            if (getSupportedEventTypes().contains(event.getType()) && !this.running) {
+            if (getSupportedEventTypes().contains(event.getType())) {
                 // Make sure to wakeup the dispatcher
-                this.scheduler.execute(this::run);
+                requestRun();
             }
         } catch (EventStreamException e) {
             this.logger.error("Failed to get supported event types", e);
@@ -107,13 +111,25 @@ public class UserEventDispatcherScheduler implements Disposable
      * Pre-filter the waiting events as soon as possible, unless the scheduler is not started yet (the first run happens
      * when it's started). The request is never dropped: when a run is already in progress, a new run follows it, so
      * that the events which became eligible during the current run (for example when the current instance just became
-     * the cluster singleton node) are not left waiting for the next scheduled run.
+     * the cluster singleton node) are not left waiting for the next scheduled run. The requests received before that
+     * run starts are merged into it.
      *
      * @since 18.10.0RC1
      */
     public void flush()
     {
         if (this.initialized) {
+            requestRun();
+        }
+    }
+
+    /**
+     * Submits a run unless one is already waiting to start: the events which became eligible since the start of the
+     * current run (if any) are pre-filtered by the next run, and the requests received meanwhile are merged into it.
+     */
+    private void requestRun()
+    {
+        if (this.pending.compareAndSet(false, true)) {
             try {
                 this.scheduler.execute(this::run);
             } catch (RejectedExecutionException e) {
@@ -132,8 +148,8 @@ public class UserEventDispatcherScheduler implements Disposable
 
     private void run()
     {
-        // Indicate the pre-filtering is running
-        this.running = true;
+        // The requests received from now on need a new run
+        this.pending.set(false);
 
         Thread currenthread = Thread.currentThread();
 
@@ -153,9 +169,6 @@ public class UserEventDispatcherScheduler implements Disposable
             // Catching Throwable to make sure we don't kill the scheduler which triggered this run
             this.logger.error("Failed to pre-filter events", e);
         } finally {
-            // Indicate the pre-filtering is not running anymore
-            this.running = false;
-
             // Remove any remaining context
             this.execution.removeContext();
         }

@@ -20,6 +20,7 @@
 package org.xwiki.notifications.notifiers.internal;
 
 import java.util.ArrayList;
+import java.util.Date;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
@@ -29,6 +30,7 @@ import javax.inject.Named;
 
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.RegisterExtension;
 import org.xwiki.context.ExecutionContextManager;
 import org.xwiki.eventstream.Event;
 import org.xwiki.eventstream.EventSearchResult;
@@ -46,8 +48,11 @@ import org.xwiki.model.reference.EntityReferenceSerializer;
 import org.xwiki.model.reference.WikiReference;
 import org.xwiki.notifications.NotificationConfiguration;
 import org.xwiki.notifications.NotificationFormat;
+import org.xwiki.observation.remote.ClusterMemberDepartureManager;
 import org.xwiki.observation.remote.ClusterSingletonManager;
 import org.xwiki.observation.remote.RemoteObservationManagerConfiguration;
+import org.xwiki.test.LogLevel;
+import org.xwiki.test.junit5.LogCaptureExtension;
 import org.xwiki.test.junit5.mockito.ComponentTest;
 import org.xwiki.test.junit5.mockito.InjectMockComponents;
 import org.xwiki.test.junit5.mockito.MockComponent;
@@ -58,6 +63,7 @@ import org.xwiki.user.group.GroupManager;
 import org.xwiki.user.internal.group.UsersCache;
 import org.xwiki.wiki.descriptor.WikiDescriptorManager;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
@@ -65,6 +71,7 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 @ComponentTest
@@ -120,6 +127,12 @@ class UserEventDispatcherTest
 
     @MockComponent
     private ClusterSingletonManager singletonManager;
+
+    @MockComponent
+    private ClusterMemberDepartureManager departureManager;
+
+    @RegisterExtension
+    private LogCaptureExtension logCapture = new LogCaptureExtension(LogLevel.INFO);
 
     private SimpleEventQuery query;
 
@@ -409,5 +422,215 @@ class UserEventDispatcherTest
         verify(this.events).search(this.query);
         verify(this.events).search(ownEventsQuery);
         verify(this.events).prefilterEvent(event);
+    }
+
+    private SimpleEventQuery departedMemberQuery(String departedMember, Date from, Date to)
+    {
+        SimpleEventQuery departedQuery = new SimpleEventQuery()
+            .eq(Event.FIELD_PREFILTERED, false)
+            .eq(Event.FIELD_REMOTE_OBSERVATION_ID, departedMember);
+        if (from != null) {
+            departedQuery.greaterOrEq(Event.FIELD_DATE, from);
+        }
+        departedQuery.less(Event.FIELD_DATE, to)
+            .addSort(Event.FIELD_DATE, SortableEventQuery.SortClause.Order.ASC)
+            .setLimit(100)
+            .not()
+            .in(Event.FIELD_ID, new ArrayList<>());
+
+        return departedQuery;
+    }
+
+    private EventSearchResult result(Event... events)
+    {
+        EventSearchResult result = mock(EventSearchResult.class);
+        when(result.getSize()).thenReturn((long) events.length);
+        when(result.stream()).thenReturn(Stream.of(events));
+
+        return result;
+    }
+
+    private Event unsupportedEvent(String remoteObservationId) throws EventStreamException
+    {
+        Event event = mock(Event.class);
+        when(event.getType()).thenReturn("unsupported");
+        when(event.getRemoteObservationId()).thenReturn(remoteObservationId);
+        when(this.events.prefilterEvent(event)).thenReturn(CompletableFuture.completedFuture(null));
+
+        return event;
+    }
+
+    private void departed(String memberId, Date departure)
+    {
+        when(this.departureManager.isDeparted(memberId)).thenReturn(true);
+        when(this.departureManager.getDepartureDate(memberId)).thenReturn(departure);
+    }
+
+    @Test
+    void flushWithDepartedMember() throws Exception
+    {
+        Date departure = new Date(100000000L);
+        departed("gone", departure);
+        when(this.departureManager.getMemberIds()).thenReturn(Set.of(REMOTE_OBSERVATION_ID));
+        when(this.remoteObservation.getReclaimMaxAge()).thenReturn(3600L);
+        when(this.remoteObservation.getReclaimDelay()).thenReturn(900L);
+        EventSearchResult emptyResult = result();
+        when(this.events.search(this.query)).thenReturn(emptyResult);
+
+        // The events of the member gone for good, produced at most one hour before it left, and until the end of the
+        // reclaim delay, queried separately from the events of the current instance
+        SimpleEventQuery departedQuery =
+            departedMemberQuery("gone", new Date(100000000L - 3600000L), new Date(100000000L + 900000L));
+        Event event = unsupportedEvent("gone");
+        EventSearchResult result1 = result(event);
+        EventSearchResult result2 = result();
+        when(this.events.search(departedQuery)).thenReturn(result1, result2);
+
+        this.dispatcher.addDepartedMember("gone");
+        this.dispatcher.flush();
+
+        verify(this.events).search(this.query);
+        verify(this.events, times(2)).search(departedQuery);
+        verify(this.events).prefilterEvent(event);
+        assertEquals("Pre-filtered [1] waiting events of the cluster member [gone] gone for good",
+            this.logCapture.getMessage(0));
+
+        // Without maximum age
+        when(this.remoteObservation.getReclaimMaxAge()).thenReturn(-1L);
+        SimpleEventQuery departedQueryWithoutMaxAge =
+            departedMemberQuery("gone", null, new Date(100000000L + 900000L));
+        when(this.events.search(departedQueryWithoutMaxAge)).thenReturn(emptyResult);
+
+        this.dispatcher.flush();
+
+        verify(this.events).search(departedQueryWithoutMaxAge);
+    }
+
+    @Test
+    void flushWhenDepartedMemberComesBackDuringBatch() throws Exception
+    {
+        Date departure = new Date(100000000L);
+        when(this.departureManager.getDepartureDate("gone")).thenReturn(departure);
+        // Departed when starting and for the first event, back for the second one
+        when(this.departureManager.isDeparted("gone")).thenReturn(true, true, false);
+        when(this.departureManager.getMemberIds()).thenReturn(Set.of(REMOTE_OBSERVATION_ID));
+        when(this.remoteObservation.getReclaimMaxAge()).thenReturn(-1L);
+        when(this.remoteObservation.getReclaimDelay()).thenReturn(0L);
+        EventSearchResult ownResult1 = result();
+        EventSearchResult ownResult2 = result();
+        when(this.events.search(this.query)).thenReturn(ownResult1, ownResult2);
+
+        Event event1 = unsupportedEvent("gone");
+        Event event2 = unsupportedEvent("gone");
+        SimpleEventQuery departedQuery = departedMemberQuery("gone", null, departure);
+        EventSearchResult departedResult = result(event1, event2);
+        when(this.events.search(departedQuery)).thenReturn(departedResult);
+
+        this.dispatcher.addDepartedMember("gone");
+        this.dispatcher.flush();
+
+        // The second event is left to the member which came back
+        verify(this.events).prefilterEvent(event1);
+        verify(this.events, never()).prefilterEvent(event2);
+        verify(this.events).search(departedQuery);
+        assertEquals("Pre-filtered [1] waiting events of the cluster member [gone] gone for good",
+            this.logCapture.getMessage(0));
+
+        // The member is part of the cluster again: it's forgotten
+        when(this.departureManager.getMemberIds()).thenReturn(Set.of(REMOTE_OBSERVATION_ID, "gone"));
+        this.dispatcher.flush();
+        this.dispatcher.flush();
+
+        verify(this.departureManager, times(2)).getMemberIds();
+        verify(this.events).search(departedQuery);
+    }
+
+    @Test
+    void flushWithManyDepartedMembers() throws Exception
+    {
+        Date departure = new Date(100000000L);
+        when(this.departureManager.getMemberIds()).thenReturn(Set.of(REMOTE_OBSERVATION_ID));
+        when(this.remoteObservation.getReclaimMaxAge()).thenReturn(-1L);
+        when(this.remoteObservation.getReclaimDelay()).thenReturn(0L);
+        EventSearchResult ownResult = result();
+        when(this.events.search(this.query)).thenReturn(ownResult);
+        for (int i = 0; i < 100; ++i) {
+            String memberId = "gone" + i;
+            departed(memberId, departure);
+            if (i == 50) {
+                when(this.events.search(departedMemberQuery(memberId, null, departure)))
+                    .thenThrow(new EventStreamException("failed"));
+            } else {
+                EventSearchResult emptyResult = result();
+                when(this.events.search(departedMemberQuery(memberId, null, departure))).thenReturn(emptyResult);
+            }
+            this.dispatcher.addDepartedMember(memberId);
+        }
+
+        this.dispatcher.flush();
+
+        // One query of constant size per member, a failure does not prevent the others
+        for (int i = 0; i < 100; ++i) {
+            verify(this.events).search(departedMemberQuery("gone" + i, null, departure));
+        }
+        assertEquals("Failed to pre-filter the waiting events of the cluster member [gone50] gone for good",
+            this.logCapture.getMessage(0));
+    }
+
+    @Test
+    void flushWithPostponedDepartedMember() throws Exception
+    {
+        when(this.departureManager.getMemberIds()).thenReturn(Set.of(REMOTE_OBSERVATION_ID));
+        // Not departed for now (for example because some members are not identified yet)
+        when(this.departureManager.getDepartureDate("gone")).thenReturn(null);
+        EventSearchResult ownResult1 = result();
+        EventSearchResult ownResult2 = result();
+        when(this.events.search(this.query)).thenReturn(ownResult1, ownResult2);
+
+        this.dispatcher.addDepartedMember("gone");
+        this.dispatcher.flush();
+        this.dispatcher.flush();
+
+        // Kept for the next pre-filtering
+        verify(this.departureManager, times(2)).getDepartureDate("gone");
+        verify(this.events, times(2)).search(any());
+
+        this.dispatcher.clearDepartedMembers();
+        this.dispatcher.flush();
+
+        verify(this.departureManager, times(2)).getDepartureDate("gone");
+    }
+
+    @Test
+    void flushWithDepartedMemberWhenNotSingletonNode() throws Exception
+    {
+        when(this.singletonManager.isSingletonNode()).thenReturn(false);
+
+        SimpleEventQuery ownEventsQuery = new SimpleEventQuery()
+            .eq(Event.FIELD_PREFILTERED, false)
+            .eq(Event.FIELD_REMOTE_OBSERVATION_ID, REMOTE_OBSERVATION_ID)
+            .addSort(Event.FIELD_DATE, SortableEventQuery.SortClause.Order.ASC)
+            .setLimit(100)
+            .not()
+            .in(Event.FIELD_ID, new ArrayList<>());
+        EventSearchResult result = mock(EventSearchResult.class);
+        when(result.getSize()).thenReturn(0L);
+        when(this.events.search(ownEventsQuery)).thenReturn(result);
+
+        this.dispatcher.addDepartedMember("gone");
+        this.dispatcher.flush();
+
+        // Only the cluster singleton node pre-filters the events of the members gone for good
+        verify(this.events).search(ownEventsQuery);
+        verifyNoInteractions(this.departureManager);
+    }
+
+    @Test
+    void shift()
+    {
+        assertEquals(new Date(1000), UserEventDispatcher.shift(new Date(0), 1));
+        assertEquals(new Date(-1000), UserEventDispatcher.shift(new Date(0), -1));
+        assertEquals(new Date(3_155_760_000_000L), UserEventDispatcher.shift(new Date(0), Long.MAX_VALUE));
+        assertEquals(new Date(-3_155_760_000_000L), UserEventDispatcher.shift(new Date(0), Long.MIN_VALUE));
     }
 }

@@ -37,6 +37,7 @@ import org.xwiki.component.phase.InitializationException;
 import org.xwiki.context.concurrent.ExecutionContextRunnable;
 import org.xwiki.eventstream.EntityEvent;
 import org.xwiki.eventstream.internal.DefaultEntityEvent;
+import org.xwiki.job.Job;
 import org.xwiki.job.JobException;
 import org.xwiki.job.JobExecutor;
 import org.xwiki.model.reference.DocumentReference;
@@ -162,11 +163,25 @@ public class PrefilteringLiveNotificationEmailManager implements Initializable, 
      */
     public void addEvents(String wikiId, List<String> remoteObservationIds)
     {
+        resumeMails(new MissingLiveNotificationMailsRequest(wikiId, remoteObservationIds));
+    }
+
+    /**
+     * Starts the resume of the live notification mails which were not sent yet for the events matching the passed
+     * request (for example the events produced by a cluster member gone for good, in a date range).
+     *
+     * @param request the request of the {@link MissingLiveNotificationMailsJob}
+     * @return the started job, or {@code null} if it could not be started (the failure is logged)
+     * @since 18.10.0RC1
+     */
+    public Job resumeMails(MissingLiveNotificationMailsRequest request)
+    {
         try {
-            this.executor.execute(MissingLiveNotificationMailsJob.JOBTYPE,
-                new MissingLiveNotificationMailsRequest(wikiId, remoteObservationIds));
+            return this.executor.execute(MissingLiveNotificationMailsJob.JOBTYPE, request);
         } catch (JobException e) {
             this.logger.error("Failed to start the processing of missed live notification events", e);
+
+            return null;
         }
     }
 }

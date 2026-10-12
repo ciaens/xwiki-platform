@@ -22,6 +22,7 @@ package org.xwiki.eventstream.store.solr.internal;
 import java.io.File;
 import java.io.IOException;
 import java.net.URL;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
@@ -811,5 +812,139 @@ class EventStoreTest
         assertSearch(List.of(eventA, eventNone, eventANoMail), new SimpleEventQuery()
             .eq(Event.FIELD_PREFILTERED, false).open().eq(Event.FIELD_REMOTE_OBSERVATION_ID, "a").or()
             .eq(Event.FIELD_REMOTE_OBSERVATION_ID, null).close());
+    }
+
+    private Set<String> searchIds(EventQuery query, Set<String> fields) throws EventStreamException
+    {
+        return this.eventStore.search(query, fields).stream().map(Event::getId).collect(Collectors.toSet());
+    }
+
+    @Test
+    void searchDepartedMemberEvents() throws EventStreamException, InterruptedException, ExecutionException
+    {
+        // Events produced by the current cluster member, without member, by a member gone for good and by another
+        // member, as queried by the pre-filtering and by the scan of the members gone for good
+        long hour = 3600000L;
+        Date departure = new Date(1700000000000L);
+        Date oldest = new Date(departure.getTime() - 24 * hour);
+
+        DefaultEvent own = event("own1", new Date(departure.getTime() - hour));
+        own.setRemoteObservationId("own");
+        DefaultEvent none = event("none1", new Date(departure.getTime() - hour));
+        DefaultEvent gone = event("gone1", new Date(departure.getTime() - hour));
+        gone.setRemoteObservationId("gone");
+        DefaultEvent goneTooOld = event("gone0", new Date(departure.getTime() - 48 * hour));
+        goneTooOld.setRemoteObservationId("gone");
+        DefaultEvent goneBack = event("gone2", new Date(departure.getTime() + hour));
+        goneBack.setRemoteObservationId("gone");
+        DefaultEvent goneDone = event("goneP", new Date(departure.getTime() - hour));
+        goneDone.setRemoteObservationId("gone");
+        goneDone.setPrefiltered(true);
+        DefaultEvent other = event("other1", new Date(departure.getTime() - hour));
+        other.setRemoteObservationId("other");
+
+        this.eventStore.saveEvent(own);
+        this.eventStore.saveEvent(none);
+        this.eventStore.saveEvent(gone);
+        this.eventStore.saveEvent(goneTooOld);
+        this.eventStore.saveEvent(goneBack);
+        this.eventStore.saveEvent(goneDone);
+        this.eventStore.saveEvent(other).get();
+
+        // The pre-filtering of the events of the current instance and without identifier
+        SimpleEventQuery flushQuery = new SimpleEventQuery().eq(Event.FIELD_PREFILTERED, false).open()
+            .eq(Event.FIELD_REMOTE_OBSERVATION_ID, "own").or().eq(Event.FIELD_REMOTE_OBSERVATION_ID, null).close();
+        flushQuery.addSort(Event.FIELD_DATE, Order.ASC).setLimit(100).not().in(Event.FIELD_ID, List.of());
+        assertEquals(Set.of("own1", "none1"), searchIds(flushQuery, null));
+
+        // The pre-filtering of the events of a member gone for good, up to a reclaim delay of one minute after it left
+        assertEquals(Set.of("gone1"), searchIds(departedMemberQuery("gone", oldest, new Date(departure.getTime()
+            + 60000)), null));
+        // Up to two hours after it left (an event produced after it left, according to the clock of the current
+        // instance)
+        assertEquals(Set.of("gone1", "gone2"), searchIds(departedMemberQuery("gone", oldest, new Date(departure
+            .getTime() + 2 * hour)), null));
+
+        // The scan of the identifiers of the members which are not part of the cluster, in the order of the
+        // identifiers
+        assertEquals(List.of("gone"), scanMembers(oldest, false, null));
+        assertEquals(List.of("other"), scanMembers(oldest, false, "gone"));
+        assertEquals(List.of(), scanMembers(oldest, false, "other"));
+        // Without mail notifications, only the events waiting to be pre-filtered
+        assertEquals(List.of("gone"), scanMembers(oldest, true, null));
+        assertEquals(List.of(), scanMembers(new Date(departure.getTime() + hour), true, "gone"));
+
+        // The count of the waiting events which are too old to be taken over
+        SimpleEventQuery countQuery = new SimpleEventQuery(0, 0).eq(Event.FIELD_PREFILTERED, false)
+            .eq(Event.FIELD_REMOTE_OBSERVATION_ID, "gone").less(Event.FIELD_DATE, oldest);
+        assertEquals(1, this.eventStore.search(countQuery).getTotalHits());
+    }
+
+    private SimpleEventQuery departedMemberQuery(String memberId, Date from, Date to)
+    {
+        SimpleEventQuery query = new SimpleEventQuery().eq(Event.FIELD_PREFILTERED, false)
+            .eq(Event.FIELD_REMOTE_OBSERVATION_ID, memberId).greaterOrEq(Event.FIELD_DATE, from)
+            .less(Event.FIELD_DATE, to);
+        query.addSort(Event.FIELD_DATE, Order.ASC).setLimit(100).not().in(Event.FIELD_ID, List.of());
+
+        return query;
+    }
+
+    private List<String> scanMembers(Date oldest, boolean prefiltered, String previousMember)
+        throws EventStreamException
+    {
+        SimpleEventQuery query = new SimpleEventQuery(0, 1);
+        if (prefiltered) {
+            query.eq(Event.FIELD_PREFILTERED, false);
+        }
+        query.greaterOrEq(Event.FIELD_DATE, oldest).not().eq(Event.FIELD_REMOTE_OBSERVATION_ID, null).not()
+            .in(Event.FIELD_REMOTE_OBSERVATION_ID, List.of("own", "web-0"));
+        if (previousMember != null) {
+            query.greater(Event.FIELD_REMOTE_OBSERVATION_ID, previousMember);
+        }
+        query.addSort(Event.FIELD_REMOTE_OBSERVATION_ID, Order.ASC);
+
+        return this.eventStore.search(query, Set.of(Event.FIELD_REMOTE_OBSERVATION_ID)).stream()
+            .map(Event::getRemoteObservationId).collect(Collectors.toList());
+    }
+
+    @Test
+    void searchManyDepartedMembers() throws EventStreamException, InterruptedException, ExecutionException
+    {
+        // Many members gone for good: the queries have the same size whatever the number of members
+        Date departure = new Date(1700000000000L);
+        Date oldest = new Date(departure.getTime() - 86400000L);
+        int count = 400;
+        List<String> memberIds = new ArrayList<>();
+        for (int i = 0; i < count; ++i) {
+            memberIds.add(String.format("xwiki-web-%03d", i));
+        }
+        for (String memberId : memberIds) {
+            DefaultEvent event = event("event-" + memberId, new Date(departure.getTime() - 60000));
+            event.setRemoteObservationId(memberId);
+            this.eventStore.saveEvent(event);
+        }
+        DefaultEvent last = event("event-own", new Date(departure.getTime() - 60000));
+        last.setRemoteObservationId("own");
+        this.eventStore.saveEvent(last).get();
+
+        // The scan finds every member, one after the other
+        List<String> found = new ArrayList<>();
+        String previousMember = null;
+        while (true) {
+            List<String> members = scanMembers(oldest, false, previousMember);
+            if (members.isEmpty()) {
+                break;
+            }
+            previousMember = members.get(0);
+            found.add(previousMember);
+        }
+        assertEquals(memberIds, found);
+
+        // The pre-filtering queries each member separately
+        for (String memberId : memberIds) {
+            assertEquals(Set.of("event-" + memberId),
+                searchIds(departedMemberQuery(memberId, oldest, new Date(departure.getTime() + 900000)), null));
+        }
     }
 }

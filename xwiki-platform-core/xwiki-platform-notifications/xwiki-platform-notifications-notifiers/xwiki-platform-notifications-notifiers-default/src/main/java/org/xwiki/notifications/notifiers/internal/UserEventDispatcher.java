@@ -20,9 +20,14 @@
 package org.xwiki.notifications.notifiers.internal;
 
 import java.util.ArrayList;
+import java.util.Date;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
+import java.util.function.BooleanSupplier;
+import java.util.function.Function;
 import java.util.stream.Collectors;
 
 import javax.inject.Inject;
@@ -54,6 +59,7 @@ import org.xwiki.model.reference.WikiReference;
 import org.xwiki.notifications.NotificationConfiguration;
 import org.xwiki.notifications.NotificationFormat;
 import org.xwiki.notifications.filters.internal.DeletedDocumentCleanUpFilterProcessingQueue;
+import org.xwiki.observation.remote.ClusterMemberDepartureManager;
 import org.xwiki.observation.remote.ClusterSingletonManager;
 import org.xwiki.observation.remote.RemoteObservationManagerConfiguration;
 import org.xwiki.user.UserException;
@@ -77,6 +83,11 @@ import org.xwiki.wiki.descriptor.WikiDescriptorManager;
 public class UserEventDispatcher
 {
     private static final long BATCH_SIZE = 100;
+
+    /**
+     * The maximum value of the configured durations (about 100 years, in seconds), to avoid overflows.
+     */
+    private static final long MAX_DURATION = 3_155_760_000L;
 
     @Inject
     private UsersCache userCache;
@@ -125,7 +136,16 @@ public class UserEventDispatcher
     private DeletedDocumentCleanUpFilterProcessingQueue cleanUpFilterProcessingQueue;
 
     @Inject
+    private ClusterMemberDepartureManager departureManager;
+
+    @Inject
     private Logger logger;
+
+    /**
+     * The identifiers of the cluster members gone for good whose waiting events are pre-filtered by the current
+     * instance when it's the cluster singleton node.
+     */
+    private final Set<String> departedMembers = ConcurrentHashMap.newKeySet();
 
     private Set<String> getSupportedEventTypes() throws EventStreamException
     {
@@ -136,8 +156,37 @@ public class UserEventDispatcher
     }
 
     /**
-     * Pre-filter any waiting event produced by the current instance, and the waiting events without remote observation
-     * identifier when the current instance is the cluster singleton node (always the case without cluster).
+     * Pre-filters the waiting events produced by a cluster member gone for good, when the current instance is the
+     * cluster singleton node: the events produced from {@code observation.remote.reclaimMaxAge} before the member left
+     * until {@code observation.remote.reclaimDelay} after it left (it was absent during that time, so the events of
+     * that period are its own, whatever the clock skew between the members). The events of each member are queried
+     * separately, after the events of the current instance, and the member is checked again before each event: a member
+     * which came back pre-filters its own events. The member is forgotten once it's part of the cluster again, or by
+     * {@link #clearDepartedMembers()}.
+     *
+     * @param memberId the identifier of the cluster member gone for good
+     * @since 18.10.0RC1
+     */
+    public void addDepartedMember(String memberId)
+    {
+        this.departedMembers.add(memberId);
+    }
+
+    /**
+     * Forgets the cluster members gone for good added with {@link #addDepartedMember(String)}, for example when the
+     * current instance stops being the cluster singleton node.
+     *
+     * @since 18.10.0RC1
+     */
+    public void clearDepartedMembers()
+    {
+        this.departedMembers.clear();
+    }
+
+    /**
+     * Pre-filter any waiting event produced by the current instance, and, when the current instance is the cluster
+     * singleton node (always the case without cluster), the waiting events without remote observation identifier and
+     * the waiting events produced by the cluster members gone for good (see {@link #addDepartedMember(String)}).
      * 
      * @throws Exception when failing
      */
@@ -146,15 +195,73 @@ public class UserEventDispatcher
         // Get supported events types
         Set<String> types = getSupportedEventTypes();
 
+        // The query is created for each batch since the current instance might become or stop being the cluster
+        // singleton node in the meantime
+        flush(types, this::createFlushQuery, null);
+
+        // The events of each member gone for good are queried separately so that the size of the queries does not
+        // depend on the number of members, and a failure does not prevent pre-filtering the other events
+        for (String memberId : this.departedMembers) {
+            if (!this.singletonManager.isSingletonNode()) {
+                break;
+            }
+
+            try {
+                flushDepartedMember(memberId, types);
+            } catch (Exception e) {
+                this.logger.error("Failed to pre-filter the waiting events of the cluster member [{}] gone for good",
+                    memberId, e);
+            }
+        }
+    }
+
+    private void flushDepartedMember(String memberId, Set<String> types) throws Exception
+    {
+        if (this.departureManager.getMemberIds().contains(memberId)) {
+            // The member came back: it pre-filters its own events
+            this.departedMembers.remove(memberId);
+
+            return;
+        }
+
+        Date departure = this.departureManager.getDepartureDate(memberId);
+        if (departure == null || !this.departureManager.isDeparted(memberId)) {
+            // The departures are postponed or forgotten: try again at the next pre-filtering
+            return;
+        }
+
+        // Stop as soon as the member is back or the current instance is not the cluster singleton node anymore
+        BooleanSupplier taken =
+            () -> this.singletonManager.isSingletonNode() && this.departureManager.isDeparted(memberId);
+        long count = flush(types, failedEvents -> createDepartedMemberQuery(failedEvents, memberId, departure), taken);
+
+        if (count > 0) {
+            this.logger.info("Pre-filtered [{}] waiting events of the cluster member [{}] gone for good", count,
+                memberId);
+        }
+    }
+
+    /**
+     * Pre-filters the events returned by the passed query until no event is left.
+     *
+     * @param types the supported event types
+     * @param queryFactory creates the query of each batch from the identifiers of the events which failed
+     * @param taken checked before each event, the loop stops when it returns {@code false}, or {@code null}
+     * @return the number of events which were pre-filtered
+     */
+    private long flush(Set<String> types, Function<List<String>, SimpleEventQuery> queryFactory, BooleanSupplier taken)
+        throws Exception
+    {
         // Events to ignore
         List<String> failedEvents = new ArrayList<>();
 
+        long count = 0;
+        boolean stop = false;
+
         // Keep getting the BATCH_SIZE oldest not pre-filtered events (except the handled ones) until we cannot find any
         // left
-        do {
-            // The query is created for each batch since the current instance might become or stop being the cluster
-            // singleton node in the meantime
-            try (EventSearchResult result = this.events.search(createFlushQuery(failedEvents))) {
+        while (!stop) {
+            try (EventSearchResult result = this.events.search(queryFactory.apply(failedEvents))) {
                 if (result.getSize() == 0) {
                     break;
                 }
@@ -163,8 +270,14 @@ public class UserEventDispatcher
                 Iterable<Event> it = () -> result.stream().iterator();
                 List<CompletableFuture<?>> completableFutures = new ArrayList<>((int) result.getSize());
                 for (Event event : it) {
+                    if (taken != null && !taken.getAsBoolean()) {
+                        stop = true;
+                        break;
+                    }
+
                     try {
                         completableFutures.add(prefilterEvent(event, types));
+                        ++count;
                     } catch (Exception e) {
                         this.logger.warn("Failed to pre filter event with id [{}]: [{}]", event.getId(),
                             ExceptionUtils.getRootCauseMessage(e));
@@ -177,7 +290,9 @@ public class UserEventDispatcher
                     completableFuture.join();
                 }
             }
-        } while (true);
+        }
+
+        return count;
     }
 
     private SimpleEventQuery createFlushQuery(List<String> failedEvents)
@@ -199,6 +314,26 @@ public class UserEventDispatcher
             // Events produced by this instance
             query.eq(Event.FIELD_REMOTE_OBSERVATION_ID, this.remoteObservation.getId());
         }
+
+        return finishFlushQuery(query, failedEvents);
+    }
+
+    private SimpleEventQuery createDepartedMemberQuery(List<String> failedEvents, String memberId, Date departure)
+    {
+        SimpleEventQuery query = new SimpleEventQuery();
+        query.eq(Event.FIELD_PREFILTERED, false);
+        query.eq(Event.FIELD_REMOTE_OBSERVATION_ID, memberId);
+        long maxAge = this.remoteObservation.getReclaimMaxAge();
+        if (maxAge >= 0) {
+            query.greaterOrEq(Event.FIELD_DATE, shift(departure, -maxAge));
+        }
+        query.less(Event.FIELD_DATE, shift(departure, this.remoteObservation.getReclaimDelay()));
+
+        return finishFlushQuery(query, failedEvents);
+    }
+
+    private SimpleEventQuery finishFlushQuery(SimpleEventQuery query, List<String> failedEvents)
+    {
         // Start by oldest events
         query.addSort(Event.FIELD_DATE, Order.ASC);
         // Limit the result to BATCH_SIZE events to not impact the memory too much
@@ -207,6 +342,19 @@ public class UserEventDispatcher
         query.not().in(Event.FIELD_ID, failedEvents);
 
         return query;
+    }
+
+    /**
+     * @param date a date
+     * @param seconds a number of seconds, limited to about 100 years in both directions
+     * @return the passed date shifted by the passed number of seconds
+     * @since 18.10.0RC1
+     */
+    static Date shift(Date date, long seconds)
+    {
+        long limited = Math.max(-MAX_DURATION, Math.min(seconds, MAX_DURATION));
+
+        return new Date(date.getTime() + TimeUnit.SECONDS.toMillis(limited));
     }
 
     private CompletableFuture<?> prefilterEvent(Event event, Set<String> types) throws EventStreamException

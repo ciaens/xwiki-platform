@@ -20,6 +20,7 @@
 package org.xwiki.notifications.notifiers.internal.email.live;
 
 import java.util.ArrayList;
+import java.util.Date;
 import java.util.List;
 
 import org.xwiki.job.AbstractRequest;
@@ -41,6 +42,12 @@ public class MissingLiveNotificationMailsRequest extends AbstractRequest
     private static final String PROPERTY_WIKI = "wiki";
 
     private static final String PROPERTY_REMOTE_OBSERVATION_IDS = "remoteObservationIds";
+
+    private static final String PROPERTY_EVENT_DATE_FROM = "eventDateFrom";
+
+    private static final String PROPERTY_EVENT_DATE_TO = "eventDateTo";
+
+    private static final String PROPERTY_RECLAIM = "reclaim";
 
     /**
      * The default constructor.
@@ -126,5 +133,72 @@ public class MissingLiveNotificationMailsRequest extends AbstractRequest
     public List<String> getRemoteObservationIds()
     {
         return getProperty(PROPERTY_REMOTE_OBSERVATION_IDS);
+    }
+
+    /**
+     * Restricts the events whose mails are resumed to the events produced in a date range. Used to take over the
+     * pending mails of a cluster member gone for good: only the events it produced before it left, and not too long
+     * before (see {@code observation.remote.reclaimMaxAge}).
+     *
+     * @param from the date from which the events are resumed (included), or {@code null} for no lower bound
+     * @param to the date until which the events are resumed (excluded), or {@code null} for no upper bound
+     * @since 18.10.0RC1
+     */
+    public void setEventDateRange(Date from, Date to)
+    {
+        setDateProperty(PROPERTY_EVENT_DATE_FROM, from);
+        setDateProperty(PROPERTY_EVENT_DATE_TO, to);
+    }
+
+    private void setDateProperty(String key, Date date)
+    {
+        if (date != null) {
+            setProperty(key, new Date(date.getTime()));
+        } else {
+            removeProperty(key);
+        }
+    }
+
+    /**
+     * @return the date from which the events are resumed (included), or {@code null} for no lower bound
+     * @since 18.10.0RC1
+     */
+    public Date getEventDateFrom()
+    {
+        return getProperty(PROPERTY_EVENT_DATE_FROM);
+    }
+
+    /**
+     * @return the date until which the events are resumed (excluded), or {@code null} for no upper bound
+     * @since 18.10.0RC1
+     */
+    public Date getEventDateTo()
+    {
+        return getProperty(PROPERTY_EVENT_DATE_TO);
+    }
+
+    /**
+     * Indicates that the job takes over the pending mails of cluster members gone for good (see
+     * {@link org.xwiki.observation.remote.ClusterMemberDepartureManager}). The job then checks before each user that
+     * each requested member is still gone for good and that the current instance is still the cluster singleton node,
+     * and stops resuming the events of a member which came back (it resumes its own mails when it starts).
+     *
+     * @param reclaim {@code true} to take over the pending mails of cluster members gone for good, {@code false} (the
+     *            default) to resume the mails without checking the members
+     * @since 18.10.0RC1
+     */
+    public void setReclaim(boolean reclaim)
+    {
+        setProperty(PROPERTY_RECLAIM, reclaim);
+    }
+
+    /**
+     * @return {@code true} if the job takes over the pending mails of cluster members gone for good
+     * @see #setReclaim(boolean)
+     * @since 18.10.0RC1
+     */
+    public boolean isReclaim()
+    {
+        return getProperty(PROPERTY_RECLAIM, false);
     }
 }
