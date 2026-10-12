@@ -19,9 +19,13 @@
  */
 package org.xwiki.notifications.notifiers.internal.email.live;
 
+import java.util.List;
+
 import javax.inject.Named;
 
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.RegisterExtension;
+import org.mockito.ArgumentCaptor;
 import org.xwiki.component.manager.ComponentLookupException;
 import org.xwiki.component.manager.ComponentManager;
 import org.xwiki.context.Execution;
@@ -29,16 +33,25 @@ import org.xwiki.context.ExecutionContextManager;
 import org.xwiki.eventstream.EntityEvent;
 import org.xwiki.eventstream.Event;
 import org.xwiki.eventstream.internal.DefaultEntityEvent;
+import org.xwiki.job.JobException;
+import org.xwiki.job.JobExecutor;
 import org.xwiki.model.reference.DocumentReference;
 import org.xwiki.model.reference.DocumentReferenceResolver;
 import org.xwiki.notifications.notifiers.internal.email.IntervalUsersManager;
 import org.xwiki.notifications.preferences.NotificationEmailInterval;
+import org.xwiki.test.LogLevel;
 import org.xwiki.test.annotation.BeforeComponent;
+import org.xwiki.test.junit5.LogCaptureExtension;
 import org.xwiki.test.junit5.mockito.ComponentTest;
 import org.xwiki.test.junit5.mockito.InjectMockComponents;
 import org.xwiki.test.junit5.mockito.MockComponent;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -64,6 +77,12 @@ class PrefilteringLiveNotificationEmailManagerTest
 
     @MockComponent
     private Execution execution;
+
+    @MockComponent
+    private JobExecutor executor;
+
+    @RegisterExtension
+    private LogCaptureExtension logCapture = new LogCaptureExtension(LogLevel.WARN);
 
     @MockComponent
     @Named("context")
@@ -103,5 +122,34 @@ class PrefilteringLiveNotificationEmailManagerTest
         Thread.sleep(100);
 
         verify(this.dispatcher).addEvent(event, userReference);
+    }
+
+    @Test
+    void addEvents() throws JobException
+    {
+        ArgumentCaptor<MissingLiveNotificationMailsRequest> requestCaptor =
+            ArgumentCaptor.forClass(MissingLiveNotificationMailsRequest.class);
+
+        this.manager.addEvents("wiki");
+        this.manager.addEvents(null, List.of("instance1"));
+
+        verify(this.executor, times(2)).execute(eq(MissingLiveNotificationMailsJob.JOBTYPE),
+            requestCaptor.capture());
+
+        assertEquals("wiki", requestCaptor.getAllValues().get(0).getWiki());
+        assertNull(requestCaptor.getAllValues().get(0).getRemoteObservationIds());
+        assertNull(requestCaptor.getAllValues().get(1).getWiki());
+        assertEquals(List.of("instance1"), requestCaptor.getAllValues().get(1).getRemoteObservationIds());
+    }
+
+    @Test
+    void addEventsFailure() throws JobException
+    {
+        when(this.executor.execute(any(), any())).thenThrow(new JobException("failed"));
+
+        this.manager.addEvents("wiki");
+
+        assertEquals("Failed to start the processing of missed live notification events",
+            this.logCapture.getMessage(0));
     }
 }

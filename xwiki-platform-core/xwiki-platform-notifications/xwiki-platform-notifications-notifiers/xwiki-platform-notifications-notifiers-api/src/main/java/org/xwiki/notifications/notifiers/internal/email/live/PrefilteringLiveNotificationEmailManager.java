@@ -19,6 +19,7 @@
  */
 package org.xwiki.notifications.notifiers.internal.email.live;
 
+import java.util.List;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.LinkedBlockingQueue;
 
@@ -138,14 +139,32 @@ public class PrefilteringLiveNotificationEmailManager implements Initializable, 
     }
 
     /**
+     * Starts the resume of the live notification mails which were not sent yet for all the events.
+     *
      * @param wikiId the identifier of the wiki in which to search for user with enabled live notifications mails
      * @since 12.6
      */
     public void addEvents(String wikiId)
     {
+        addEvents(wikiId, null);
+    }
+
+    /**
+     * Starts the resume of the live notification mails which were not sent yet for the events produced by some
+     * members of the cluster (see {@link MissingLiveNotificationMailsRequest#setRemoteObservationIds(List)}).
+     *
+     * @param wikiId the identifier of the wiki in which to search for user with enabled live notifications mails, or
+     *            {@code null} for all the wikis
+     * @param remoteObservationIds the remote observation identifiers of the cluster members whose events should be
+     *            resumed, a {@code null} element standing for the events without remote observation identifier, or
+     *            {@code null} for all the events
+     * @since 18.9.0RC1
+     */
+    public void addEvents(String wikiId, List<String> remoteObservationIds)
+    {
         try {
             this.executor.execute(MissingLiveNotificationMailsJob.JOBTYPE,
-                new MissingLiveNotificationMailsRequest(wikiId));
+                new MissingLiveNotificationMailsRequest(wikiId, remoteObservationIds));
         } catch (JobException e) {
             this.logger.error("Failed to start the processing of missed live notification events", e);
         }

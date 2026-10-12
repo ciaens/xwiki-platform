@@ -500,10 +500,12 @@ rendering.transformations = $xwikiRenderingTransformations
 #-# [Since 17.5.0]
 #-# Indicate the unique identifier of the instance among the members of a cluster.
 #-# By default it is automatically generated from a UUID and stored in the permanent directory.
-#-# The identifier should stay the same when the instance is restarted (keep the permanent directory or set this
-#-# property): some of the work of the instance is associated with its identifier and handled by the member with that
-#-# identifier. An identifier which has been absent from the cluster for observation.remote.reclaimDelay is considered
-#-# gone for good, and the cluster singleton node can then take over the work which was left pending.
+#-# The identifier must stay the same when the instance is restarted (keep the permanent directory or set this
+#-# property): the events produced by the instance are associated with it, and a cluster member pre-filters the
+#-# events and resumes the pending live notification mails associated with its own identifier (the cluster singleton
+#-# node also handles the events without identifier). An identifier which has been absent from the cluster for
+#-# observation.remote.reclaimDelay is considered gone for good, and the cluster singleton node can then take over the
+#-# work which was left pending.
 #-# 
 # observation.remote.id = node1
 

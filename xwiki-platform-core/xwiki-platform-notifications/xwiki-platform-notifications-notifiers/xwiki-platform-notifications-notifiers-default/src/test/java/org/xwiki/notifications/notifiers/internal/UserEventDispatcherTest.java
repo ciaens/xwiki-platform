@@ -46,6 +46,7 @@ import org.xwiki.model.reference.EntityReferenceSerializer;
 import org.xwiki.model.reference.WikiReference;
 import org.xwiki.notifications.NotificationConfiguration;
 import org.xwiki.notifications.NotificationFormat;
+import org.xwiki.observation.remote.ClusterSingletonManager;
 import org.xwiki.observation.remote.RemoteObservationManagerConfiguration;
 import org.xwiki.test.junit5.mockito.ComponentTest;
 import org.xwiki.test.junit5.mockito.InjectMockComponents;
@@ -117,6 +118,9 @@ class UserEventDispatcherTest
     @MockComponent
     private RemoteObservationManagerConfiguration remoteObservation;
 
+    @MockComponent
+    private ClusterSingletonManager singletonManager;
+
     private SimpleEventQuery query;
 
     @BeforeEach
@@ -129,6 +133,7 @@ class UserEventDispatcherTest
         when(this.recordableEventDescriptorManager.getRecordableEventDescriptors(true)).thenReturn(
             List.of(descriptor1, descriptor2));
         when(this.remoteObservation.getId()).thenReturn(REMOTE_OBSERVATION_ID);
+        when(this.singletonManager.isSingletonNode()).thenReturn(true);
 
         query = new SimpleEventQuery()
             .eq(Event.FIELD_PREFILTERED, false)
@@ -347,5 +352,62 @@ class UserEventDispatcherTest
         verify(this.ecm, times(3)).pushContext(any(), eq(false));
         verify(this.ecm, times(3)).popContext();
 
+    }
+
+    @Test
+    void flushWhenNotSingletonNode() throws Exception
+    {
+        when(this.singletonManager.isSingletonNode()).thenReturn(false);
+
+        // The events without remote observation identifier are pre-filtered by the cluster singleton node only
+        SimpleEventQuery ownEventsQuery = new SimpleEventQuery()
+            .eq(Event.FIELD_PREFILTERED, false)
+            .eq(Event.FIELD_REMOTE_OBSERVATION_ID, REMOTE_OBSERVATION_ID)
+            .addSort(Event.FIELD_DATE, SortableEventQuery.SortClause.Order.ASC)
+            .setLimit(100)
+            .not()
+            .in(Event.FIELD_ID, new ArrayList<>());
+        EventSearchResult result = mock(EventSearchResult.class);
+        when(result.getSize()).thenReturn(0L);
+        when(this.events.search(ownEventsQuery)).thenReturn(result);
+
+        this.dispatcher.flush();
+
+        verify(this.events).search(ownEventsQuery);
+        verify(this.events, never()).search(this.query);
+    }
+
+    @Test
+    void flushWhenSingletonNodeLostDuringFlush() throws Exception
+    {
+        // The current instance stops being the cluster singleton node after the first batch
+        when(this.singletonManager.isSingletonNode()).thenReturn(true, false);
+
+        SimpleEventQuery ownEventsQuery = new SimpleEventQuery()
+            .eq(Event.FIELD_PREFILTERED, false)
+            .eq(Event.FIELD_REMOTE_OBSERVATION_ID, REMOTE_OBSERVATION_ID)
+            .addSort(Event.FIELD_DATE, SortableEventQuery.SortClause.Order.ASC)
+            .setLimit(100)
+            .not()
+            .in(Event.FIELD_ID, new ArrayList<>());
+
+        Event event = mock(Event.class);
+        when(event.getType()).thenReturn("unsupported");
+        when(this.events.prefilterEvent(event)).thenReturn(CompletableFuture.completedFuture(null));
+        EventSearchResult result1 = mock(EventSearchResult.class, "result1");
+        when(result1.getSize()).thenReturn(1L);
+        when(result1.stream()).thenReturn(Stream.of(event));
+        when(this.events.search(this.query)).thenReturn(result1);
+
+        EventSearchResult result2 = mock(EventSearchResult.class, "result2");
+        when(result2.getSize()).thenReturn(0L);
+        when(this.events.search(ownEventsQuery)).thenReturn(result2);
+
+        this.dispatcher.flush();
+
+        // The second batch does not include the events without remote observation identifier anymore
+        verify(this.events).search(this.query);
+        verify(this.events).search(ownEventsQuery);
+        verify(this.events).prefilterEvent(event);
     }
 }
