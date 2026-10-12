@@ -32,7 +32,7 @@
   <description>Default implementation of the API to queue asynchronous tasks dedicated to the analysis of wiki pages.</description>
   <packaging>jar</packaging>
   <properties>
-    <xwiki.jacoco.instructionRatio>0.84</xwiki.jacoco.instructionRatio>
+    <xwiki.jacoco.instructionRatio>0.91</xwiki.jacoco.instructionRatio>
     <!-- Name to display by the Extension Manager -->
     <xwiki.extension.name>Default implementation of the Index API</xwiki.extension.name>
   </properties>
@@ -50,6 +50,11 @@
     <dependency>
       <groupId>org.xwiki.platform</groupId>
       <artifactId>xwiki-platform-oldcore</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.xwiki.platform</groupId>
+      <artifactId>xwiki-platform-observation-remote</artifactId>
       <version>${project.version}</version>
     </dependency>
     <!-- Test dependencies. -->
