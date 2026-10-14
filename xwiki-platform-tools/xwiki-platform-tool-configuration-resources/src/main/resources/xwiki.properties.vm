@@ -87,6 +87,21 @@
 # core.initialization.eager = false
 
 #-# [Since 18.10.0RC1]
+#-# Indicate if XWiki should stop once the database schema updates and data migrations and the Distribution Wizard are
+#-# done, which is meant for a one-shot upgrade job started with the new version of XWiki before the cluster members
+#-# (for example a Kubernetes Job run before a rolling update). It implies core.initialization.eager (and thus needs
+#-# "xwiki.home" in xwiki.cfg) and requires the migrations to be enabled (xwiki.store.migration=1 in xwiki.cfg). The
+#-# Distribution Wizard is not interactive in this mode and runs on the main wiki then on each sub-wiki.
+#-# The process then stops with the exit code:
+#-#   0: the databases and the distribution are upgraded;
+#-#   1: the initialization failed, or the database of a wiki could not be initialized or migrated, or is newer than
+#-#      this version of XWiki;
+#-#   2: the Distribution Wizard or one of the extension jobs it started failed, or a wiki does not have the expected
+#-#      version of its user interface afterwards.
+#-# Default value is false.
+# core.initialization.exitAfterUpgrade = false
+
+#-# [Since 18.10.0RC1]
 #-# Indicate if the "/health" endpoint exposes the details of each check (initialization progress, distribution state,
 #-# error messages). The endpoint is not authenticated, so by default only the state and the ready flag of each check
 #-# are exposed, and errors are reduced to the class name of their root cause. Even when the details are disabled,

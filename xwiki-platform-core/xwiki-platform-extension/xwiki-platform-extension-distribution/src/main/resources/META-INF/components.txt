@@ -5,6 +5,9 @@ org.xwiki.extension.distribution.internal.DistributionInitializerListener
 org.xwiki.extension.distribution.internal.DistributionInternalScriptService
 org.xwiki.extension.distribution.internal.DistributionReadinessIndicator
 org.xwiki.extension.distribution.internal.DocumentsModifiedDuringDistributionListener
+org.xwiki.extension.distribution.internal.UpgradeAndExitListener
+org.xwiki.extension.distribution.internal.UpgradeAndExitRunner
+org.xwiki.extension.distribution.internal.UpgradeAndExitSteps
 org.xwiki.extension.distribution.internal.WikiDistributionWikiEventListener
 org.xwiki.extension.distribution.internal.job.DefaultDistributionJob
 org.xwiki.extension.distribution.internal.job.step.CleanExtensionsDistributionStep

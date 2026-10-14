@@ -184,6 +184,9 @@ xwiki.store.migration=1
 
 #-# Whether to exit after migration. Useful when a server should handle migrations for a large database, without going
 #-# live afterwards.
+#-# [Deprecated since 18.10.0RC1] Use core.initialization.exitAfterUpgrade in xwiki.properties instead: this property
+#-# exits in the middle of the initialization (before the Distribution Wizard), only when the migrations succeed and
+#-# always with the exit code 0.
 # xwiki.store.migration.exitAfterEnd=0
 
 #-# Indicate the list of databases to migrate.

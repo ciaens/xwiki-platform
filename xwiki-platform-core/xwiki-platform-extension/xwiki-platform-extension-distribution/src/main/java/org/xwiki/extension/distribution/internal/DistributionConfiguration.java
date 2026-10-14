@@ -20,6 +20,7 @@
 package org.xwiki.extension.distribution.internal;
 
 import javax.inject.Inject;
+import javax.inject.Named;
 import javax.inject.Singleton;
 
 import org.xwiki.component.annotation.Component;
@@ -35,8 +36,19 @@ import org.xwiki.configuration.ConfigurationSource;
 @Singleton
 public class DistributionConfiguration
 {
+    /**
+     * The {@code xwiki.properties} property asking to stop XWiki once the databases and the distribution are upgraded.
+     *
+     * @since 18.10.0RC1
+     */
+    public static final String PROPERTY_EXIT_AFTER_UPGRADE = "core.initialization.exitAfterUpgrade";
+
     @Inject
     private ConfigurationSource configurationSource;
+
+    @Inject
+    @Named("xwikiproperties")
+    private ConfigurationSource xwikiProperties;
 
     /**
      * @return true if the automatic launch of DW is enabled on main wiki
@@ -55,20 +67,31 @@ public class DistributionConfiguration
     }
 
     /**
-     * @return true if the distribution wizard is interactive on main wiki
+     * @return true if the distribution wizard is interactive on main wiki (never when XWiki stops after the upgrade)
      * @since 17.4.0RC1
      */
     public boolean isInteractiveDistributionWizardEnabledForMainWiki()
     {
-        return configurationSource.getProperty("distribution.job.interactive", true);
+        return !isExitAfterUpgrade() && configurationSource.getProperty("distribution.job.interactive", true);
     }
 
     /**
-     * @return true if the distribution wizard is interactive on subwikis
+     * @return true if the distribution wizard is interactive on subwikis (never when XWiki stops after the upgrade)
      * @since 17.4.0RC1
      */
     public boolean isInteractiveDistributionWizardEnabledForWiki()
     {
-        return configurationSource.getProperty("distribution.job.interactive.wiki", true);
+        return !isExitAfterUpgrade() && configurationSource.getProperty("distribution.job.interactive.wiki", true);
+    }
+
+    /**
+     * @return true if XWiki is started only to upgrade the databases and the distribution (Distribution Wizard on every
+     *         wiki, not interactive), and then stopped
+     * @since 18.10.0RC1
+     */
+    public boolean isExitAfterUpgrade()
+    {
+        // Read from xwiki.properties only: the wiki preferences are not available before the end of the initialization
+        return this.xwikiProperties.getProperty(PROPERTY_EXIT_AFTER_UPGRADE, false);
     }
 }

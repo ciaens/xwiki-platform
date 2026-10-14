@@ -25,6 +25,7 @@ import java.net.URISyntaxException;
 import java.net.URL;
 import java.util.Collections;
 
+import jakarta.annotation.Priority;
 import jakarta.inject.Inject;
 import jakarta.inject.Named;
 import jakarta.inject.Singleton;
@@ -33,6 +34,7 @@ import org.apache.commons.lang3.StringUtils;
 import org.apache.commons.lang3.exception.ExceptionUtils;
 import org.slf4j.Logger;
 import org.xwiki.component.annotation.Component;
+import org.xwiki.component.descriptor.ComponentDescriptor;
 import org.xwiki.configuration.ConfigurationSource;
 import org.xwiki.environment.Environment;
 import org.xwiki.environment.internal.ServletEnvironment;
@@ -52,7 +54,7 @@ import com.xpn.xwiki.web.XWikiServletResponseStub;
 /**
  * Optionally start the initialization of the main {@link XWiki} instance as soon as the servlet context is started,
  * instead of waiting for the first HTTP request. Enabled with the {@code core.initialization.eager} property of
- * {@code xwiki.properties}, disabled by default.
+ * {@code xwiki.properties} (or implied by {@code core.initialization.exitAfterUpgrade}), disabled by default.
  * <p>
  * The initialization job needs a {@link XWikiContext} with a request, because
  * {@link com.xpn.xwiki.util.XWikiStubContextProvider} is initialized from it and every background thread (including
@@ -73,6 +75,10 @@ import com.xpn.xwiki.web.XWikiServletResponseStub;
 @Component
 @Named(XWikiInitializerStartupListener.NAME)
 @Singleton
+// The initialization runs in its own thread and initializes the data migration manager, whose list of migrations
+// includes the ones of the installed extensions: start it only after the default priority listeners of the same event
+// ran, among which the one loading the installed extensions (ExtensionApplicationStartedListener)
+@Priority(XWikiInitializerStartupListener.PRIORITY)
 public class XWikiInitializerStartupListener extends AbstractEventListener
 {
     /**
@@ -81,9 +87,24 @@ public class XWikiInitializerStartupListener extends AbstractEventListener
     public static final String NAME = "XWikiInitializerStartupListener";
 
     /**
+     * The priority of the listener: after the listeners of {@link ApplicationStartedEvent} with the default priority.
+     *
+     * @since 18.10.0RC1
+     */
+    public static final int PRIORITY = ComponentDescriptor.DEFAULT_PRIORITY + 1000;
+
+    /**
      * The {@code xwiki.properties} property enabling the eager initialization.
      */
     public static final String PROPERTY_EAGER = "core.initialization.eager";
+
+    /**
+     * The {@code xwiki.properties} property asking to stop XWiki once the databases and the distribution are upgraded,
+     * which implies the eager initialization.
+     *
+     * @since 18.10.0RC1
+     */
+    public static final String PROPERTY_EXIT_AFTER_UPGRADE = "core.initialization.exitAfterUpgrade";
 
     private static final String CFG_HOME = "xwiki.home";
 
@@ -112,7 +133,8 @@ public class XWikiInitializerStartupListener extends AbstractEventListener
     @Override
     public void onEvent(Event event, Object source, Object data)
     {
-        if (!this.properties.getProperty(PROPERTY_EAGER, false)) {
+        if (!this.properties.getProperty(PROPERTY_EAGER, false)
+            && !this.properties.getProperty(PROPERTY_EXIT_AFTER_UPGRADE, false)) {
             return;
         }
 

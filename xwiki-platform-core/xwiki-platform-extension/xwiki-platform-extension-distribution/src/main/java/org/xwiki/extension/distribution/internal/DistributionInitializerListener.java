@@ -85,6 +85,12 @@ public class DistributionInitializerListener implements EventListener
 
     private void onApplicationReady()
     {
+        // When XWiki stops after the upgrade, the DW is started once the databases are checked
+        // (see UpgradeAndExitListener)
+        if (this.distributionConfiguration.isExitAfterUpgrade()) {
+            return;
+        }
+
         // If the DW is not interactive, trigger it right away
         if (!this.distributionConfiguration.isInteractiveDistributionWizardEnabledForMainWiki()) {
             DistributionState distributionState = this.distributionManager.getFarmDistributionState();

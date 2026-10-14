@@ -19,6 +19,7 @@
  */
 package org.xwiki.health.internal;
 
+import jakarta.annotation.Priority;
 import jakarta.inject.Named;
 import jakarta.servlet.ServletContext;
 
@@ -26,6 +27,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
 import org.mockito.ArgumentCaptor;
+import org.xwiki.component.descriptor.ComponentDescriptor;
 import org.xwiki.component.util.ReflectionUtils;
 import org.xwiki.configuration.ConfigurationSource;
 import org.xwiki.environment.Environment;
@@ -104,12 +106,18 @@ class XWikiInitializerStartupListenerTest
         assertEquals(XWikiInitializerStartupListener.NAME, this.listener.getName());
         assertEquals(1, this.listener.getEvents().size());
         assertTrue(this.listener.getEvents().get(0) instanceof ApplicationStartedEvent);
+        // After the listeners with the default priority, among which the one loading the installed extensions
+        assertEquals(XWikiInitializerStartupListener.PRIORITY,
+            XWikiInitializerStartupListener.class.getAnnotation(Priority.class).value());
+        assertTrue(XWikiInitializerStartupListener.PRIORITY > ComponentDescriptor.DEFAULT_PRIORITY);
     }
 
     @Test
     void disabledByDefault() throws Exception
     {
         when(this.properties.getProperty(XWikiInitializerStartupListener.PROPERTY_EAGER, false)).thenReturn(false);
+        when(this.properties.getProperty(XWikiInitializerStartupListener.PROPERTY_EXIT_AFTER_UPGRADE, false))
+            .thenReturn(false);
 
         onEvent();
 
@@ -212,5 +220,21 @@ class XWikiInitializerStartupListenerTest
             this.logCapture.getMessage(0));
         assertEquals("Failed to start XWiki initialization eagerly: [IllegalStateException: broken]",
             this.logCapture.getMessage(1));
+    }
+
+    @Test
+    void enabledByExitAfterUpgrade() throws Exception
+    {
+        when(this.properties.getProperty(XWikiInitializerStartupListener.PROPERTY_EAGER, false)).thenReturn(false);
+        when(this.properties.getProperty(XWikiInitializerStartupListener.PROPERTY_EXIT_AFTER_UPGRADE, false))
+            .thenReturn(true);
+        when(this.xwikicfg.getProperty("xwiki.home", String.class)).thenReturn("http://localhost:8080/xwiki/");
+
+        onEvent();
+
+        verify(this.spy).startInitialization(any());
+        assertEquals(1, this.logCapture.size());
+        assertEquals("Starting XWiki initialization eagerly with home URL [http://localhost:8080/xwiki/]",
+            this.logCapture.getMessage(0));
     }
 }

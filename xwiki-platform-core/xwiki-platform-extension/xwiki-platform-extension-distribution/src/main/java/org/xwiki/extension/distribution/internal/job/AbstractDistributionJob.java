@@ -254,10 +254,11 @@ public abstract class AbstractDistributionJob<R extends DistributionRequest>
         signalReady();
 
         // After finishing the main wiki distribution job, trigger non-interactive wiki distribution jobs (subwiki
-        // extensions very often depend on extensions installed in the context of the main wiki)
+        // extensions very often depend on extensions installed in the context of the main wiki). When XWiki stops
+        // after the upgrade, they are started and waited for by UpgradeAndExitListener instead.
         WikiDescriptorManager wikis = this.wikiDescriptorManagerProvider.get();
         if (!this.distributionConfiguration.isInteractiveDistributionWizardEnabledForWiki()
-            && wikis.isMainWiki(getWiki())) {
+            && !this.distributionConfiguration.isExitAfterUpgrade() && wikis.isMainWiki(getWiki())) {
             try {
                 Collection<String> wikiIds = wikis.getAllIds();
                 Thread distributionJobThread = new Thread(() -> runSubWikiDistributions(wikiIds, wikis));
