@@ -21,6 +21,7 @@
 package com.xpn.xwiki.store.migration.hibernate;
 
 import java.io.IOException;
+import java.time.Duration;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
@@ -31,11 +32,14 @@ import javax.persistence.criteria.CriteriaBuilder;
 import javax.persistence.criteria.CriteriaQuery;
 import javax.persistence.criteria.Root;
 
+import org.apache.commons.lang3.exception.ExceptionUtils;
 import org.hibernate.HibernateException;
 import org.hibernate.Session;
 import org.hibernate.Transaction;
 import org.xwiki.component.annotation.Component;
 import org.xwiki.component.manager.ComponentLookupException;
+import org.xwiki.store.hibernate.HibernateAdapter;
+import org.xwiki.store.hibernate.HibernateStoreException;
 
 import com.xpn.xwiki.XWikiContext;
 import com.xpn.xwiki.XWikiException;
@@ -80,6 +84,11 @@ public class HibernateDataMigrationManager extends AbstractDataMigrationManager
     public static final String CHANGELOG_NAME = "liquibase.xml";
 
     /**
+     * The name of the database lock held while initializing or migrating the database.
+     */
+    private static final String LOCK_NAME = "xwiki-migration";
+
+    /**
      * @return store system for execute store-specific actions.
      * @throws DataMigrationException if the store could not be reached
      */
@@ -98,6 +107,54 @@ public class HibernateDataMigrationManager extends AbstractDataMigrationManager
             return this.componentManager.getInstance(HibernateStore.class);
         } catch (ComponentLookupException e) {
             throw new DataMigrationException("Unable to reach the store", e);
+        }
+    }
+
+    private HibernateAdapter getAdapter() throws DataMigrationException
+    {
+        try {
+            return getStore().getAdapter();
+        } catch (HibernateException e) {
+            throw new DataMigrationException("Unable to get the database adapter", e);
+        }
+    }
+
+    @Override
+    protected boolean isDatabaseLockSupported()
+    {
+        try {
+            return getAdapter().isLockSupported();
+        } catch (DataMigrationException e) {
+            this.logger.warn("Failed to check if the database supports locks: {}",
+                ExceptionUtils.getRootCauseMessage(e));
+
+            return false;
+        }
+    }
+
+    @Override
+    protected boolean tryLockDatabase(Duration timeout) throws DataMigrationException
+    {
+        try {
+            return getAdapter().tryLock(LOCK_NAME, timeout);
+        } catch (HibernateStoreException e) {
+            throw new DataMigrationException("Failed to acquire the database migration lock", e);
+        }
+    }
+
+    @Override
+    protected boolean isDatabaseLockHeld() throws DataMigrationException
+    {
+        return getAdapter().isLockHeld(LOCK_NAME);
+    }
+
+    @Override
+    protected void unlockDatabase() throws DataMigrationException
+    {
+        try {
+            getAdapter().unlock(LOCK_NAME);
+        } catch (HibernateStoreException e) {
+            throw new DataMigrationException("Failed to release the database migration lock", e);
         }
     }
 

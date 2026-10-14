@@ -176,6 +176,10 @@ xwiki.tags=1
 
 #-# Whether schema updates and migrations are enabled or not. Should be enabled when upgrading, but for a better
 #-# startup time it is better to disable them in production.
+#-# [Since 18.10.0RC1] In a cluster, several members can have them enabled: on PostgreSQL, MySQL and MariaDB only one
+#-# member at a time initializes or migrates the database (see store.migration.lockTimeout in xwiki.properties). A
+#-# member with migrations disabled refuses an outdated database, and reads its version again every 10 seconds, so it
+#-# can be used without a restart once another member has migrated it.
 xwiki.store.migration=1
 
 #-# Whether to exit after migration. Useful when a server should handle migrations for a large database, without going

@@ -19,6 +19,7 @@
  */
 package com.xpn.xwiki.store.migration;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
@@ -29,9 +30,14 @@ import java.util.Map;
 import java.util.Set;
 import java.util.SortedMap;
 import java.util.TreeMap;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
+import java.util.function.LongSupplier;
 
 import javax.inject.Inject;
+import javax.inject.Provider;
 
+import org.apache.commons.lang3.exception.ExceptionUtils;
 import org.slf4j.Logger;
 import org.xwiki.bridge.event.WikiDeletedEvent;
 import org.xwiki.component.manager.ComponentLookupException;
@@ -44,6 +50,8 @@ import org.xwiki.job.event.status.JobProgressManager;
 import org.xwiki.observation.EventListener;
 import org.xwiki.observation.ObservationManager;
 import org.xwiki.observation.event.Event;
+import org.xwiki.observation.remote.RemoteObservationManagerConfiguration;
+import org.xwiki.stability.Unstable;
 
 import com.xpn.xwiki.XWikiConfig;
 import com.xpn.xwiki.XWikiContext;
@@ -59,6 +67,17 @@ import com.xpn.xwiki.store.migration.hibernate.HibernateDataMigration;
  */
 public abstract class AbstractDataMigrationManager implements DataMigrationManager, Initializable
 {
+    /**
+     * How long to wait for the database lock between two log messages.
+     */
+    private static final Duration LOCK_WAIT_LOG_INTERVAL = Duration.ofSeconds(60);
+
+    /**
+     * How long a database found outdated by a member which does not migrate it is refused before reading its version
+     * again.
+     */
+    private static final long OUTDATED_RECHECK_INTERVAL = TimeUnit.SECONDS.toNanos(10);
+
     /**
      * Component manager used to access stores and data migrations.
      */
@@ -76,6 +95,9 @@ public abstract class AbstractDataMigrationManager implements DataMigrationManag
 
     @Inject
     protected HibernateConfiguration hibernateConfiguration;
+
+    @Inject
+    private Provider<RemoteObservationManagerConfiguration> remoteObservationConfiguration;
 
     /**
      * Ordered list of migrators that may be applied.
@@ -199,6 +221,11 @@ public abstract class AbstractDataMigrationManager implements DataMigrationManag
         private boolean migrationAttempted;
 
         /**
+         * When the version was read, as a {@link System#nanoTime()} value.
+         */
+        private long readTime;
+
+        /**
          * Build a simple status with no migration attempted, just storing the current database version.
          *
          * @param version the current database version
@@ -207,6 +234,19 @@ public abstract class AbstractDataMigrationManager implements DataMigrationManag
         {
             this.version = version;
             this.migrationAttempted = false;
+        }
+
+        /**
+         * Build a simple status with no migration attempted, storing the current database version and when it was
+         * read.
+         *
+         * @param version the current database version
+         * @param readTime when the version was read, as a {@link System#nanoTime()} value
+         */
+        MigrationStatus(XWikiDBVersion version, long readTime)
+        {
+            this(version);
+            this.readTime = readTime;
         }
 
         /**
@@ -251,7 +291,22 @@ public abstract class AbstractDataMigrationManager implements DataMigrationManag
     /**
      * A cache of wiki database version.
      */
-    private final Map<String, MigrationStatus> statusCache = new HashMap<>();
+    private final Map<String, MigrationStatus> statusCache = new ConcurrentHashMap<>();
+
+    /**
+     * True once the absence of a database lock shared by the cluster members has been reported.
+     */
+    private boolean missingLockReported;
+
+    /**
+     * True while this instance holds the database lock shared by the cluster members.
+     */
+    private boolean databaseLocked;
+
+    /**
+     * The source of the time used to decide when an outdated database should be checked again.
+     */
+    private LongSupplier ticker = System::nanoTime;
 
     /**
      * The final database version when the migration process finishes. This is use to compute the DBVersion of an empty
@@ -449,7 +504,7 @@ public abstract class AbstractDataMigrationManager implements DataMigrationManag
                 synchronized (this.statusCache) {
                     XWikiDBVersion version = getDBVersionFromDatabase();
                     if (version != null) {
-                        this.statusCache.put(wikiName, new MigrationStatus(version));
+                        this.statusCache.put(wikiName, new MigrationStatus(version, this.ticker.getAsLong()));
                     }
                     return version;
                 }
@@ -471,7 +526,7 @@ public abstract class AbstractDataMigrationManager implements DataMigrationManag
                 synchronized (this.statusCache) {
                     XWikiDBVersion version = getDBVersionFromDatabase();
                     if (version != null) {
-                        dbStatus = new MigrationStatus(version);
+                        dbStatus = new MigrationStatus(version, this.ticker.getAsLong());
                         this.statusCache.put(wikiName, dbStatus);
                     }
                 }
@@ -580,6 +635,40 @@ public abstract class AbstractDataMigrationManager implements DataMigrationManag
             return;
         }
         try {
+            // Initialize an empty database, or proceed with migrations (only once)
+            if (getDatabaseStatus() == null
+                || (this.migrations != null && this.hibernateConfiguration.isMigrationEnabled())) {
+                initializeOrMigrateDatabase();
+            }
+
+            preventAccessToOutdatedDb();
+        } finally {
+            this.lock.unlock();
+        }
+    }
+
+    /**
+     * Initialize the current database if it's empty and run the migrations if they are enabled and did not run yet,
+     * while holding the database lock shared by the cluster members, if the store supports one. The synchronization
+     * makes sure that only one thread of this instance holds or waits for the database lock.
+     *
+     * @throws DataMigrationException when failing to acquire the database lock, to initialize the database or to
+     *             migrate it
+     */
+    private synchronized void initializeOrMigrateDatabase() throws DataMigrationException
+    {
+        boolean locked = lockDatabase();
+        this.databaseLocked = locked;
+        try {
+            if (locked) {
+                // Another cluster member may have initialized or migrated the databases while this instance was
+                // waiting for the lock: forget the versions read before acquiring it, but keep the result of the
+                // migrations attempted by this instance (a failed migration must keep failing)
+                synchronized (this.statusCache) {
+                    this.statusCache.values().removeIf(status -> !status.hasDataMigrationBeenAttempted());
+                }
+            }
+
             if (getDatabaseStatus() == null) {
                 initializeCurrentDatabase();
             }
@@ -588,11 +677,147 @@ public abstract class AbstractDataMigrationManager implements DataMigrationManag
             if (this.migrations != null) {
                 tryToProcceedToMigration();
             }
-
-            preventAccessToOutdatedDb();
         } finally {
-            this.lock.unlock();
+            if (locked) {
+                this.databaseLocked = false;
+                releaseDatabaseLock();
+            }
         }
+    }
+
+    private void releaseDatabaseLock()
+    {
+        try {
+            unlockDatabase();
+        } catch (DataMigrationException e) {
+            // Don't hide the result of the migration: the store closes a connection holding a lock it failed to
+            // release
+            this.logger.warn("Failed to release the database migration lock: {}",
+                ExceptionUtils.getRootCauseMessage(e));
+        }
+    }
+
+    /**
+     * Acquire the database lock shared by the cluster members, waiting for it as long as configured.
+     *
+     * @return true if the lock has been acquired, false if the store does not support such a lock
+     * @throws DataMigrationException when the lock could not be acquired in time
+     */
+    private boolean lockDatabase() throws DataMigrationException
+    {
+        if (!isDatabaseLockSupported()) {
+            if (!this.missingLockReported && isClustered()) {
+                this.missingLockReported = true;
+                this.logger.warn("The database does not support locks shared by the cluster members: make sure that "
+                    + "only one cluster member initializes or migrates it at a time");
+            }
+
+            return false;
+        }
+
+        if (tryLockDatabase(Duration.ZERO)) {
+            return true;
+        }
+
+        Duration timeout = this.hibernateConfiguration.getMigrationLockTimeout();
+        this.logger.info("Waiting for the database migration lock held by another cluster member");
+        Duration waited = Duration.ZERO;
+        while (true) {
+            // An interrupted thread can't wait anymore (the lock requests return immediately): stop instead of
+            // looping, and keep the interruption flag for the caller
+            if (Thread.currentThread().isInterrupted()) {
+                throw new DataMigrationException("Interrupted while waiting for the database migration lock held by"
+                    + " another cluster member");
+            }
+
+            Duration wait = LOCK_WAIT_LOG_INTERVAL;
+            if (!timeout.isZero()) {
+                Duration remaining = timeout.minus(waited);
+                if (remaining.isNegative() || remaining.isZero()) {
+                    throw new DataMigrationException(String.format("Gave up waiting for the database migration lock"
+                        + " held by another cluster member after [%d] seconds (store.migration.lockTimeout)",
+                        waited.toSeconds()));
+                }
+                if (remaining.compareTo(wait) < 0) {
+                    wait = remaining;
+                }
+            }
+
+            if (tryLockDatabase(wait)) {
+                this.logger.info("Acquired the database migration lock");
+
+                return true;
+            }
+
+            waited = waited.plus(wait);
+            this.logger.info("Still waiting for the database migration lock held by another cluster member after"
+                + " [{}] seconds", waited.toSeconds());
+        }
+    }
+
+    private boolean isClustered()
+    {
+        try {
+            return this.remoteObservationConfiguration.get().isEnabled();
+        } catch (Exception e) {
+            this.logger.debug("Failed to read the remote observation configuration", e);
+
+            return false;
+        }
+    }
+
+    /**
+     * Indicate if the store supports a lock shared by all the processes (cluster members) using the database. When it
+     * does, the database initialization and the migrations are done while holding it.
+     *
+     * @return true if the store supports a lock shared by all the processes using the database
+     * @since 18.10.0RC1
+     */
+    @Unstable
+    protected boolean isDatabaseLockSupported()
+    {
+        return false;
+    }
+
+    /**
+     * Try to acquire the lock shared by all the processes (cluster members) using the database.
+     *
+     * @param timeout the maximum time to wait for the lock, {@link Duration#ZERO} to try only once
+     * @return true if the lock has been acquired, false if it's held by another process after the passed duration
+     * @throws DataMigrationException when failing to request the lock
+     * @since 18.10.0RC1
+     */
+    @Unstable
+    protected boolean tryLockDatabase(Duration timeout) throws DataMigrationException
+    {
+        return true;
+    }
+
+    /**
+     * Indicate if the lock acquired with {@link #tryLockDatabase(Duration)} is still held. The database server releases
+     * the lock when the connection holding it is closed, for example after an idle timeout of the database server or
+     * of the network, and another cluster member can then acquire it.
+     *
+     * @return true if the lock is still held
+     * @throws DataMigrationException when failing to check the lock
+     * @since 18.10.0RC1
+     */
+    @Unstable
+    protected boolean isDatabaseLockHeld() throws DataMigrationException
+    {
+        return true;
+    }
+
+    /**
+     * Release the lock acquired with {@link #tryLockDatabase(Duration)}.
+     *
+     * @throws DataMigrationException when failing to release the lock
+     * @since 18.10.0RC1
+     */
+    @Unstable
+    protected void unlockDatabase() throws DataMigrationException
+    {
+        // Nothing to release by default
     }
 
     private void initializeCurrentDatabase() throws DataMigrationException
@@ -635,6 +860,10 @@ public abstract class AbstractDataMigrationManager implements DataMigrationManag
         DataMigrationStatus status = getDataMigrationStatus();
 
         if (getLatestVersion().compareTo(status.getDBVersion()) > 0) {
+            status = recheckOutdatedDb(status);
+        }
+
+        if (getLatestVersion().compareTo(status.getDBVersion()) > 0) {
             if (status.hasDataMigrationBeenAttempted() && !status.hasBeenSuccessfullyMigrated()) {
                 String message = String.format(
                     "Migration of database [%s] has failed, it could not be safely used! Database is currently in"
@@ -650,6 +879,41 @@ public abstract class AbstractDataMigrationManager implements DataMigrationManag
                 throw new MigrationRequiredException(message);
             }
         }
+    }
+
+    /**
+     * Read again the version of an outdated database which this instance did not try to migrate, at most every
+     * {@link #OUTDATED_RECHECK_INTERVAL}, since another cluster member may have migrated it meanwhile.
+     *
+     * @param status the current status of the database
+     * @return the status to use
+     * @throws DataMigrationException when failing to read the version
+     */
+    private DataMigrationStatus recheckOutdatedDb(DataMigrationStatus status) throws DataMigrationException
+    {
+        if (!status.hasDataMigrationBeenAttempted() && status instanceof MigrationStatus migrationStatus
+            && this.ticker.getAsLong() - migrationStatus.readTime >= OUTDATED_RECHECK_INTERVAL) {
+            String wikiId = getXWikiContext().getWikiId();
+            synchronized (this.statusCache) {
+                // Only forget the status which was checked, not a newer one stored by another thread
+                if (this.statusCache.get(wikiId) == status) {
+                    this.statusCache.remove(wikiId);
+                }
+            }
+
+            DataMigrationStatus newStatus = getDataMigrationStatus();
+            if (newStatus == null) {
+                return status;
+            }
+
+            if (getLatestVersion().compareTo(newStatus.getDBVersion()) <= 0) {
+                this.logger.info("Database [{}] has been migrated to version [{}]", wikiId, newStatus.getDBVersion());
+            }
+
+            return newStatus;
+        }
+
+        return status;
     }
 
     /**
@@ -714,6 +978,7 @@ public abstract class AbstractDataMigrationManager implements DataMigrationManag
 
         try {
             // We should migrate the main wiki first to be able to access subwiki descriptors if needed.
+            checkDatabaseLock();
             if (!migrateDatabase(getMainXWiki())) {
                 String message = "Main wiki database migration failed, it is not safe to continue!";
                 this.logger.error(message);
@@ -724,6 +989,7 @@ public abstract class AbstractDataMigrationManager implements DataMigrationManag
             for (String database : databasesToMigrate) {
                 this.progress.startStep(this);
 
+                checkDatabaseLock();
                 if (!migrateDatabase(database)) {
                     errorCount++;
                 }
@@ -738,6 +1004,24 @@ public abstract class AbstractDataMigrationManager implements DataMigrationManag
             }
         } finally {
             this.progress.popLevelProgress(this);
+        }
+    }
+
+    /**
+     * Make sure that this instance still holds the database lock before migrating a database, so that the migration
+     * never continues at the same time as the one of another cluster member which acquired the lock after it was
+     * lost.
+     *
+     * @throws DataMigrationException when the database lock has been lost
+     */
+    private void checkDatabaseLock() throws DataMigrationException
+    {
+        if (this.databaseLocked && !isDatabaseLockHeld()) {
+            String message = "Lost the database migration lock (the connection holding it was closed, for example by"
+                + " an idle timeout of the database server or of the network): stopping the migration so that it does"
+                + " not run at the same time as the one of another cluster member";
+            this.logger.error(message);
+            throw new DataMigrationException(message);
         }
     }
 

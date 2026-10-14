@@ -20,6 +20,7 @@
 package org.xwiki.store.hibernate;
 
 import java.sql.Driver;
+import java.time.Duration;
 
 import org.hibernate.SessionFactory;
 import org.hibernate.boot.Metadata;
@@ -158,4 +159,75 @@ public interface HibernateAdapter
      * @return true if the current database product is catalog based, false for a schema based databases
      */
     boolean isCatalog();
+
+    // Locks
+
+    /**
+     * Indicate if {@link #tryLock(String, Duration)} provides a lock shared by every process (for example every
+     * member of a cluster) accessing the database. When it does not, {@link #tryLock(String, Duration)} always
+     * succeeds immediately and only the synchronization of the current process applies.
+     *
+     * @return true if the database supports locks shared by all the processes using it
+     * @since 18.10.0RC1
+     */
+    @Unstable
+    default boolean isLockSupported()
+    {
+        return false;
+    }
+
+    /**
+     * Try to acquire a lock shared by every process accessing the database (an advisory lock of the database server,
+     * not a lock on a table or a row), waiting at most the passed duration. The lock is held on a dedicated
+     * connection until {@link #unlock(String)} is called, and it is released by the database server if that
+     * connection is lost (for example when the process is killed, or after an idle timeout of the database server or
+     * of the network, see {@link #isLockHeld(String)}). The lock is not re-entrant: trying to acquire a lock already
+     * held by this adapter fails with an {@link IllegalStateException}. The callers are expected to serialize the
+     * requests for a same lock.
+     *
+     * @param name the name of the lock, qualified by the adapter with the main wiki database so that several XWiki
+     *            instances sharing a database server don't share their locks
+     * @param timeout the maximum time to wait for the lock, {@link Duration#ZERO} to try only once
+     * @return true if the lock has been acquired, or if the database does not support locks (see
+     *         {@link #isLockSupported()}), false if it's held by another process after the passed duration
+     * @throws HibernateStoreException when failing to execute the lock request
+     * @throws IllegalStateException when the lock is already held by this adapter
+     * @since 18.10.0RC1
+     */
+    @Unstable
+    default boolean tryLock(String name, Duration timeout) throws HibernateStoreException
+    {
+        return true;
+    }
+
+    /**
+     * Release a lock acquired with {@link #tryLock(String, Duration)}, and the connection it was held on. Does
+     * nothing if the lock is not held by this adapter.
+     *
+     * @param name the name of the lock
+     * @throws HibernateStoreException when failing to execute the unlock request (the connection is released anyway)
+     * @since 18.10.0RC1
+     */
+    @Unstable
+    default void unlock(String name) throws HibernateStoreException
+    {
+        // Nothing to release when the database does not support locks
+    }
+
+    /**
+     * Indicate if a lock acquired with {@link #tryLock(String, Duration)} is still held, that is if the connection
+     * holding it is still valid. The database server releases the lock when that connection is closed, which can also
+     * happen while it's idle (idle timeout of the database server, of a proxy or of the network), and another process
+     * can then acquire it.
+     *
+     * @param name the name of the lock
+     * @return true if the lock is held by this adapter on a valid connection, or if the database does not support
+     *         locks (see {@link #isLockSupported()}), false otherwise
+     * @since 18.10.0RC1
+     */
+    @Unstable
+    default boolean isLockHeld(String name)
+    {
+        return true;
+    }
 }
