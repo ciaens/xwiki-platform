@@ -33,6 +33,7 @@ import org.xwiki.context.ExecutionContextManager;
 import org.xwiki.eventstream.EntityEvent;
 import org.xwiki.eventstream.Event;
 import org.xwiki.eventstream.internal.DefaultEntityEvent;
+import org.xwiki.job.Job;
 import org.xwiki.job.JobException;
 import org.xwiki.job.JobExecutor;
 import org.xwiki.model.reference.DocumentReference;
@@ -48,6 +49,7 @@ import org.xwiki.test.junit5.mockito.MockComponent;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
@@ -149,6 +151,26 @@ class PrefilteringLiveNotificationEmailManagerTest
 
         this.manager.addEvents("wiki");
 
+        assertEquals("Failed to start the processing of missed live notification events",
+            this.logCapture.getMessage(0));
+    }
+
+    @Test
+    void resumeMails() throws JobException
+    {
+        MissingLiveNotificationMailsRequest request = new MissingLiveNotificationMailsRequest(null, List.of("gone"));
+        Job job = mock(Job.class);
+        when(this.executor.execute(MissingLiveNotificationMailsJob.JOBTYPE, request)).thenReturn(job);
+
+        assertSame(job, this.manager.resumeMails(request));
+    }
+
+    @Test
+    void resumeMailsFailure() throws JobException
+    {
+        when(this.executor.execute(any(), any())).thenThrow(new JobException("failed"));
+
+        assertNull(this.manager.resumeMails(new MissingLiveNotificationMailsRequest(null, List.of("gone"))));
         assertEquals("Failed to start the processing of missed live notification events",
             this.logCapture.getMessage(0));
     }

@@ -19,6 +19,7 @@
  */
 package org.xwiki.notifications.notifiers.internal;
 
+import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
@@ -28,7 +29,9 @@ import org.mockito.Mockito;
 import org.xwiki.component.manager.ComponentLifecycleException;
 import org.xwiki.context.Execution;
 import org.xwiki.context.ExecutionContextManager;
+import org.xwiki.eventstream.RecordableEventDescriptor;
 import org.xwiki.eventstream.RecordableEventDescriptorManager;
+import org.xwiki.eventstream.internal.DefaultEvent;
 import org.xwiki.test.junit5.mockito.ComponentTest;
 import org.xwiki.test.junit5.mockito.InjectMockComponents;
 import org.xwiki.test.junit5.mockito.MockComponent;
@@ -36,10 +39,12 @@ import org.xwiki.test.junit5.mockito.MockComponent;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.atLeast;
 import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.timeout;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 
 /**
  * Validate {@link UserEventDispatcherScheduler}.
@@ -134,5 +139,56 @@ class UserEventDispatcherSchedulerTest
 
         TimeUnit.MILLISECONDS.sleep(100);
         verify(this.dispatcher, times(1)).flush();
+    }
+
+    @Test
+    void eventsDuringRun() throws Exception
+    {
+        RecordableEventDescriptor descriptor = mock(RecordableEventDescriptor.class);
+        when(descriptor.getEventType()).thenReturn("update");
+        when(this.recordableEventDescriptorManager.getRecordableEventDescriptors(true)).thenReturn(List.of(descriptor));
+        DefaultEvent event = new DefaultEvent();
+        event.setType("update");
+
+        CountDownLatch runStarted = new CountDownLatch(1);
+        CountDownLatch releaseRun = new CountDownLatch(1);
+        doAnswer(invocation -> {
+            runStarted.countDown();
+            releaseRun.await(TIMEOUT, TimeUnit.MILLISECONDS);
+            return null;
+        }).doNothing().when(this.dispatcher).flush();
+
+        this.scheduler.initialize();
+        assertTrue(runStarted.await(TIMEOUT, TimeUnit.MILLISECONDS));
+
+        // 50 local events and pre-filtering requests while a run is in progress
+        for (int i = 0; i < 50; ++i) {
+            this.scheduler.onEvent(event);
+            this.scheduler.flush();
+        }
+        releaseRun.countDown();
+
+        // They are merged into a single run
+        verify(this.dispatcher, timeout(TIMEOUT).times(2)).flush();
+        TimeUnit.MILLISECONDS.sleep(200);
+        verify(this.dispatcher, times(2)).flush();
+    }
+
+    @Test
+    void eventBeforeInitialize() throws Exception
+    {
+        RecordableEventDescriptor descriptor = mock(RecordableEventDescriptor.class);
+        when(descriptor.getEventType()).thenReturn("update");
+        when(this.recordableEventDescriptorManager.getRecordableEventDescriptors(true)).thenReturn(List.of(descriptor));
+        DefaultEvent event = new DefaultEvent();
+        event.setType("update");
+        DefaultEvent otherEvent = new DefaultEvent();
+        otherEvent.setType("other");
+
+        // A supported local event wakes up the dispatcher, even before the scheduler is started
+        this.scheduler.onEvent(otherEvent);
+        this.scheduler.onEvent(event);
+
+        verify(this.dispatcher, timeout(TIMEOUT)).flush();
     }
 }
