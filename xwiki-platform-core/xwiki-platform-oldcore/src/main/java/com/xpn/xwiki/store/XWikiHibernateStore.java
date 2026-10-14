@@ -24,10 +24,12 @@ import java.io.Serializable;
 import java.nio.charset.StandardCharsets;
 import java.sql.SQLException;
 import java.sql.Statement;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.Date;
+import java.util.Deque;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
@@ -51,13 +53,16 @@ import org.apache.commons.collections4.CollectionUtils;
 import org.apache.commons.collections4.map.ReferenceMap;
 import org.apache.commons.lang3.ArrayUtils;
 import org.apache.commons.lang3.StringUtils;
+import org.apache.commons.lang3.exception.ExceptionUtils;
 import org.hibernate.FlushMode;
 import org.hibernate.HibernateException;
 import org.hibernate.ObjectNotFoundException;
 import org.hibernate.Session;
 import org.hibernate.SessionFactory;
+import org.hibernate.Transaction;
 import org.hibernate.boot.Metadata;
 import org.hibernate.cfg.Configuration;
+import org.hibernate.exception.ConstraintViolationException;
 import org.hibernate.mapping.PersistentClass;
 import org.hibernate.mapping.Property;
 import org.hibernate.query.NativeQuery;
@@ -133,6 +138,18 @@ public class XWikiHibernateStore extends XWikiHibernateBaseStore implements XWik
     private static final String DOC_ID = "docId";
     private static final String SELECT_DISTINCT_DOC_FULLNAME = "select distinct doc.fullName";
 
+    private static final String MAKE_SPACE_VISIBLE =
+        "update XWikiSpace as space set space.hidden = false where space.id = :id and space.hidden = true";
+
+    /**
+     * The SQL states that a transaction inserting a space can get when another transaction inserts the same space at
+     * the same time: 23505 (unique violation) for PostgreSQL, H2, HSQLDB, Derby and DB2, 23000 (integrity constraint
+     * violation) for MySQL, MariaDB and Oracle, and 40001 for the deadlock MySQL and MariaDB report when several
+     * transactions wait for the same duplicate key. Other errors use them too, so the space is read again before
+     * concluding.
+     */
+    private static final Set<String> SPACE_CONFLICT_SQL_STATES = Set.of("23505", "23000", "40001");
+
     @Inject
     private Logger logger;
 
@@ -207,7 +224,8 @@ public class XWikiHibernateStore extends XWikiHibernateBaseStore implements XWik
     private final Map<Long, ReentrantLock> documentSavingLockMap = Collections.synchronizedMap(new ReferenceMap<>());
 
     /**
-     * Same mechanism used for saving spaces.
+     * Same mechanism used for inserting space rows: the threads of this instance that need the same missing space wait
+     * for the first one to commit it and then find it, instead of failing to insert it.
      */
     private final Map<Long, ReentrantLock> spaceSavingLockMap = Collections.synchronizedMap(new ReferenceMap<>());
 
@@ -558,6 +576,10 @@ public class XWikiHibernateStore extends XWikiHibernateBaseStore implements XWik
                 // initialized
                 doc.initialize();
 
+                // Before the transaction of the document takes its database connection, make sure the space of a new
+                // document exists
+                prepareSpaceTable(doc, context);
+
                 if (bTransaction) {
                     checkHibernate(context);
                     SessionFactory sfactory = injectCustomMappingsInSessionFactory(doc, context);
@@ -790,61 +812,293 @@ public class XWikiHibernateStore extends XWikiHibernateBaseStore implements XWik
         }
     }
 
-    private void updateXWikiSpaceTable(XWikiDocument document, Session session)
+    private void updateXWikiSpaceTable(XWikiDocument document, Session session) throws XWikiException
     {
         if (document.getLocale().equals(Locale.ROOT)) {
-            // It's possible the space does not yet exist yet
+            // Make sure the space exists, and that it is visible with its parents when the document is visible (which
+            // covers a document that became visible)
             maybeCreateSpace(document.getDocumentReference().getLastSpaceReference(), document.isHidden(), session);
 
-            // If the hidden state of an existing document did not changed there is nothing to do
-            if (!document.isNew() && !Objects.equals(document.isHidden(), document.getOriginalDocument().isHidden())) {
-                if (Boolean.TRUE.equals(document.isHidden())) {
-                    // If the document became hidden it's possible the space did too
-                    maybeMakeSpaceHidden(document.getDocumentReference().getLastSpaceReference(),
-                        document.getFullName(), session);
-                } else {
-                    // If the document became visible then all its parents should be visible as well
-                    makeSpaceVisible(document.getDocumentReference().getLastSpaceReference(), session);
-                }
+            // If the document became hidden it's possible the space did too
+            if (!document.isNew() && Boolean.TRUE.equals(document.isHidden())
+                && !Objects.equals(document.isHidden(), document.getOriginalDocument().isHidden())) {
+                maybeMakeSpaceHidden(document.getDocumentReference().getLastSpaceReference(), document.getFullName(),
+                    session);
             }
         }
     }
 
-    private void insertXWikiSpace(XWikiSpace space, Session session)
+    /**
+     * Make sure that the space of a new document and its parents exist in the space table before the transaction of
+     * the document starts.
+     * <p>
+     * Several documents of a new space can be saved at the same time, by several threads or by several cluster
+     * members, and they all find the space missing. The space row is identified by an id computed from its reference,
+     * so if each document transaction inserted it, the one committed last would fail on the primary key and the whole
+     * document save would be rolled back. Instead, the missing spaces are inserted in short transactions of their own
+     * (see {@link #insertXWikiSpace(XWikiSpace)}), committed before the transaction of the document takes its database
+     * connection, so that the thread never holds two connections of the pool at the same time. The transaction of the
+     * document then only updates the hidden flag of the spaces.
+     * <p>
+     * This is only done for a new document saved outside of any transaction: the space of an existing document
+     * normally exists already, and a save that is part of a larger transaction relies on its caller or on the
+     * fallback of {@link #maybeCreateSpace(SpaceReference, boolean, Session)}.
+     *
+     * @param document the document about to be saved
+     * @param context the XWiki context
+     * @throws XWikiException when failing to read or to insert a space
+     */
+    private void prepareSpaceTable(XWikiDocument document, XWikiContext context) throws XWikiException
+    {
+        if (document.isNew() && document.getLocale().equals(Locale.ROOT) && this.store.getCurrentSession() == null) {
+            checkHibernate(context);
+
+            SpaceReference spaceReference = document.getDocumentReference().getLastSpaceReference();
+            List<SpaceReference> missingSpaces =
+                executeInSpaceTransaction(false, spaceSession -> findMissingSpaces(spaceReference, spaceSession));
+            insertMissingSpaces(missingSpaces);
+        }
+    }
+
+    /**
+     * Make sure that the space of a saved document exists, and that it is visible with its parents when the document
+     * is visible.
+     * <p>
+     * The space normally exists already (see {@link #prepareSpaceTable(XWikiDocument, XWikiContext)}). It can still be
+     * missing when the document was not known as new before its transaction started, when the save is part of a larger
+     * transaction, or when the space was deleted in the mean time with its last other document. The missing spaces are
+     * then inserted the same way, in short transactions of their own, so in this rare case the thread takes a second
+     * database connection while the transaction of the document holds the first one. Failing the save instead would
+     * make it impossible to save a document whose space row is missing.
+     *
+     * @param spaceReference the space of the saved document
+     * @param hidden {@code true} if the saved document is hidden
+     * @param session the session of the document transaction
+     * @throws XWikiException when failing to insert a missing space
+     */
+    private void maybeCreateSpace(SpaceReference spaceReference, boolean hidden, Session session)
+        throws XWikiException
+    {
+        XWikiSpace space = loadXWikiSpace(spaceReference, session);
+
+        if (space == null) {
+            insertMissingSpaces(findMissingSpaces(spaceReference, session));
+
+            if (!hidden) {
+                makeSpaceVisible(spaceReference, session);
+            }
+        } else if (!hidden && space.isHidden()) {
+            // The space is made visible with a statement, don't keep a hidden copy of it in the session
+            session.detach(space);
+
+            makeSpaceVisible(spaceReference, session);
+        }
+    }
+
+    /**
+     * Find the spaces missing from the space table, from a space up to its first existing parent.
+     *
+     * @param spaceReference a space
+     * @param session the session to read the space table with
+     * @return the space and its parents that are missing from the space table, parents first
+     */
+    private List<SpaceReference> findMissingSpaces(SpaceReference spaceReference, Session session)
+    {
+        Deque<SpaceReference> missingSpaces = new ArrayDeque<>();
+
+        EntityReference reference = spaceReference;
+        while (reference instanceof SpaceReference currentReference) {
+            XWikiSpace space = session.get(XWikiSpace.class, XWikiSpace.getId(currentReference));
+            if (space != null) {
+                // The row is only checked, don't keep a copy that a later statement could make stale
+                session.detach(space);
+
+                break;
+            }
+
+            missingSpaces.push(currentReference);
+            reference = currentReference.getParent();
+        }
+
+        return new ArrayList<>(missingSpaces);
+    }
+
+    /**
+     * Insert missing spaces hidden, each in its own transaction. A visible document makes them visible in its own
+     * transaction, so a document save that fails after this leaves only hidden empty spaces behind.
+     * <p>
+     * One transaction per space rather than one for all of them, because on some databases (PostgreSQL) a failed
+     * statement aborts the transaction, so a conflict on a parent space would prevent inserting its child.
+     *
+     * @param missingSpaces the spaces to insert, parents first
+     * @throws XWikiException when failing to insert a space
+     */
+    private void insertMissingSpaces(List<SpaceReference> missingSpaces) throws XWikiException
+    {
+        for (SpaceReference missingSpace : missingSpaces) {
+            insertXWikiSpace(new XWikiSpace(missingSpace, true));
+        }
+    }
+
+    /**
+     * Insert a space row in its own session and transaction.
+     * <p>
+     * The threads of this instance that need the same missing space wait for the first one to commit it, and then find
+     * it. Another cluster member (or a transaction of this instance that did not see the row yet) can still insert the
+     * same row at the same time: the failure of this transaction is then expected, and is ignored once the row is
+     * confirmed to exist.
+     *
+     * @param space the space to insert
+     * @throws XWikiException when failing to insert the space
+     */
+    private void insertXWikiSpace(XWikiSpace space) throws XWikiException
     {
         Lock lock = this.spaceSavingLockMap.computeIfAbsent(space.getId(), id -> new ReentrantLock(true));
         lock.lock();
         try {
-            // Insert the space
-            session.save(space);
+            executeInSpaceTransaction(true, spaceSession -> {
+                // Another thread of this instance may have inserted the space while this one was waiting for the lock
+                if (spaceSession.get(XWikiSpace.class, space.getId()) == null) {
+                    spaceSession.save(space);
+                } else {
+                    this.logger.debug("Space [{}] was inserted by another thread", space.getSpaceReference());
+                }
 
-            // Update parent space
-            if (space.getSpaceReference().getParent() instanceof SpaceReference parentReference) {
-                maybeCreateSpace(parentReference, space.isHidden(), session);
+                return null;
+            });
+        } catch (RuntimeException e) {
+            if (!isSpaceConflict(e) || !isInsertedByAnotherTransaction(space, e)) {
+                throw e;
             }
+
+            this.logger.debug("Space [{}] was inserted by another transaction: [{}]", space.getSpaceReference(),
+                ExceptionUtils.getRootCauseMessage(e));
         } finally {
             lock.unlock();
         }
     }
 
-    private void makeSpaceVisible(SpaceReference spaceReference, Session session)
+    /**
+     * Check whether a transaction inserting a space may have failed because of another transaction.
+     *
+     * @param exception the failure of a transaction inserting a space
+     * @return {@code true} if the failure can come from another transaction inserting the same space
+     */
+    private boolean isSpaceConflict(Throwable exception)
     {
-        XWikiSpace space = loadXWikiSpace(spaceReference, session);
+        for (Throwable cause : ExceptionUtils.getThrowableList(exception)) {
+            if (cause instanceof ConstraintViolationException) {
+                return true;
+            }
 
-        makeSpaceVisible(space, session);
+            if (cause instanceof SQLException sqlException) {
+                // Not every SQLException has a SQL state (for example when the connection is closed)
+                String sqlState = sqlException.getSQLState();
+                if (sqlState != null && SPACE_CONFLICT_SQL_STATES.contains(sqlState)) {
+                    return true;
+                }
+            }
+        }
+
+        return false;
     }
 
-    private void makeSpaceVisible(XWikiSpace space, Session session)
+    /**
+     * Check, in a new transaction, that a space failed to be inserted because another transaction inserted it: the
+     * same SQL states are used by other constraints (a NOT NULL column for example), which are real errors.
+     *
+     * @param space the space that failed to be inserted
+     * @param failure the failure, to which a failure to check the space is attached
+     * @return {@code true} if the space exists
+     */
+    private boolean isInsertedByAnotherTransaction(XWikiSpace space, RuntimeException failure)
     {
-        if (space.isHidden()) {
-            space.setHidden(false);
+        try {
+            return executeInSpaceTransaction(false,
+                spaceSession -> spaceSession.get(XWikiSpace.class, space.getId()) != null);
+        } catch (XWikiException | RuntimeException e) {
+            failure.addSuppressed(e);
 
-            session.update(space);
+            return false;
+        }
+    }
 
-            // Update parent
-            if (space.getSpaceReference().getParent() instanceof SpaceReference parentReference) {
-                makeSpaceVisible(parentReference, session);
+    /**
+     * Execute some work on the space table in a new session and transaction, independent from the current ones if any,
+     * which are restored afterwards.
+     * <p>
+     * The session is opened, switched to the current wiki and closed by {@link HibernateStore}, like the session of any
+     * other transaction: in particular a failure to switch to the wiki ends this transaction and not the current one.
+     * This takes a database connection from the pool, so the callers avoid holding another one at the same time.
+     *
+     * @param <T> the type of the result
+     * @param commit {@code true} to commit the transaction when the work succeeds, {@code false} to roll it back
+     * @param callback the work to execute
+     * @return the result of the work
+     * @throws XWikiException when failing to open the session or to switch it to the current wiki
+     */
+    private <T> T executeInSpaceTransaction(boolean commit, HibernateCallback<T> callback) throws XWikiException
+    {
+        Session currentSession = this.store.getCurrentSession();
+        Transaction currentTransaction = this.store.getCurrentTransaction();
+        this.store.setCurrentSession(null);
+        this.store.setCurrentTransaction(null);
+
+        try {
+            boolean success = false;
+            try {
+                this.store.beginTransaction();
+
+                T result = callback.doInHibernate(this.store.getCurrentSession());
+
+                success = true;
+
+                return result;
+            } finally {
+                if (success && commit) {
+                    // A unique constraint violation is reported by the commit
+                    this.store.endTransaction(true);
+                } else {
+                    rollbackSpaceTransaction();
+                }
             }
+        } finally {
+            this.store.setCurrentSession(currentSession);
+            this.store.setCurrentTransaction(currentTransaction);
+        }
+    }
+
+    private void rollbackSpaceTransaction()
+    {
+        try {
+            this.store.endTransaction(false);
+        } catch (RuntimeException e) {
+            // The failure that made the transaction end, if any, is the one that matters and is handled by the caller
+            this.logger.debug("Failed to rollback a transaction on the space table: [{}]",
+                ExceptionUtils.getRootCauseMessage(e));
+        }
+    }
+
+    /**
+     * Make a space and its parents visible with an UPDATE statement, up to the first space that is already visible
+     * (the parents of a visible space are visible). The statement only changes rows that are hidden, including rows
+     * committed by other transactions after this one started, which a loaded {@link XWikiSpace} would not show, and
+     * waits for a transaction that is changing the same row.
+     * <p>
+     * The statement does not change the {@link XWikiSpace} instances already loaded in the session: the caller detaches
+     * the one it loaded, and any other copy of these spaces loaded earlier in the same session keeps its hidden flag.
+     *
+     * @param spaceReference the first space to make visible
+     * @param session the session of the document transaction
+     */
+    private void makeSpaceVisible(SpaceReference spaceReference, Session session)
+    {
+        EntityReference reference = spaceReference;
+        while (reference instanceof SpaceReference currentReference) {
+            Query<?> query = session.createQuery(MAKE_SPACE_VISIBLE);
+            query.setParameter("id", XWikiSpace.getId(currentReference));
+
+            reference = query.executeUpdate() > 0 ? currentReference.getParent() : null;
         }
     }
 
@@ -875,19 +1129,6 @@ public class XWikiHibernateStore extends XWikiHibernateBaseStore implements XWik
             if (spaceReference.getParent() instanceof SpaceReference parentReference) {
                 maybeMakeSpaceHidden(parentReference, modifiedDocument, session);
             }
-        }
-    }
-
-    private void maybeCreateSpace(SpaceReference spaceReference, boolean hidden, Session session)
-    {
-        XWikiSpace space = loadXWikiSpace(spaceReference, session);
-
-        if (space != null) {
-            if (space.isHidden() && !hidden) {
-                makeSpaceVisible(space, session);
-            }
-        } else {
-            insertXWikiSpace(new XWikiSpace(spaceReference, hidden), session);
         }
     }
 
@@ -992,6 +1233,9 @@ public class XWikiHibernateStore extends XWikiHibernateBaseStore implements XWik
 
         try {
             if (sameSession) {
+                // Before the transaction takes its database connection, make sure the space of the new document exists
+                prepareSpaceTable(newDocument, context);
+
                 // We execute the whole call with a commit at the end,
                 // but we ensure to not commit at each step (save and delete)
                 executeWrite(context, session -> {
@@ -1008,6 +1252,7 @@ public class XWikiHibernateStore extends XWikiHibernateBaseStore implements XWik
             } else {
                 // Execute the save on the right DB with a commit at the end
                 context.setWikiReference(targetWikiReference);
+                prepareSpaceTable(newDocument, context);
                 executeWrite(context, session -> {
                     saveXWikiDoc(newDocument, context, false);
 
