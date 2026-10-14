@@ -20,10 +20,12 @@
 package org.xwiki.notifications.notifiers.internal.email.live;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Date;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 
@@ -45,6 +47,7 @@ import org.xwiki.test.junit5.mockito.ComponentTest;
 import org.xwiki.test.junit5.mockito.InjectMockComponents;
 import org.xwiki.test.junit5.mockito.MockComponent;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.Mockito.mock;
@@ -72,7 +75,7 @@ class PrefilteringLiveNotificationEmailDispatcherTest
     @Named("context")
     private ComponentManager componentManager;
 
-    private final List<Runnable> scheduledTasks = new ArrayList<>();
+    private final List<Runnable> scheduledTasks = Collections.synchronizedList(new ArrayList<>());
 
     @BeforeComponent
     void beforeComponent() throws ComponentLookupException
@@ -161,5 +164,45 @@ class PrefilteringLiveNotificationEmailDispatcherTest
         List<Runnable> tasks = new ArrayList<>(this.scheduledTasks);
         this.scheduledTasks.clear();
         tasks.forEach(Runnable::run);
+    }
+
+    @Test
+    void addSameEventConcurrently() throws Exception
+    {
+        int threadCount = 8;
+        CyclicBarrier barrier = new CyclicBarrier(threadCount);
+
+        for (int round = 0; round < 50; round++) {
+            DefaultEvent event = new DefaultEvent();
+            event.setId("concurrent" + round);
+            event.setDate(new Date());
+
+            List<Thread> threads = new ArrayList<>();
+            for (int i = 0; i < threadCount; i++) {
+                DocumentReference user = new DocumentReference("wiki", "XWiki", "user" + i);
+                Thread thread = new Thread(() -> {
+                    try {
+                        barrier.await();
+                    } catch (Exception e) {
+                        Thread.currentThread().interrupt();
+                    }
+                    this.dispatcher.addEvent(event, user);
+                });
+                threads.add(thread);
+                thread.start();
+            }
+            for (Thread thread : threads) {
+                thread.join();
+            }
+
+            // The same event added at the same time by several threads is queued (and scheduled) only once
+            assertEquals(1, this.scheduledTasks.size());
+
+            Map<DocumentReference, List<Event>> events = new HashMap<>();
+            for (int i = 0; i < threadCount; i++) {
+                events.put(new DocumentReference("wiki", "XWiki", "user" + i), List.of(event));
+            }
+            verifySendMailsCalled(events);
+        }
     }
 }

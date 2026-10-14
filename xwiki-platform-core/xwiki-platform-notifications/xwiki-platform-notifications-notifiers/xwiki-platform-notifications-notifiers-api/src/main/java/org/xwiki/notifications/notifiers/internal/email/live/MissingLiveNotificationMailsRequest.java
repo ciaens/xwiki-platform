@@ -19,6 +19,9 @@
  */
 package org.xwiki.notifications.notifiers.internal.email.live;
 
+import java.util.ArrayList;
+import java.util.List;
+
 import org.xwiki.job.AbstractRequest;
 import org.xwiki.job.Request;
 
@@ -36,6 +39,8 @@ public class MissingLiveNotificationMailsRequest extends AbstractRequest
     private static final long serialVersionUID = 1L;
 
     private static final String PROPERTY_WIKI = "wiki";
+
+    private static final String PROPERTY_REMOTE_OBSERVATION_IDS = "remoteObservationIds";
 
     /**
      * The default constructor.
@@ -64,6 +69,20 @@ public class MissingLiveNotificationMailsRequest extends AbstractRequest
     }
 
     /**
+     * @param wiki the id of the wiki in which to search for user having enabled live notification mails, or
+     *            {@code null} for all the wikis
+     * @param remoteObservationIds the remote observation identifiers of the cluster members whose events should be
+     *            resumed (see {@link #setRemoteObservationIds(List)}), or {@code null} for all the events
+     * @since 18.9.0RC1
+     */
+    public MissingLiveNotificationMailsRequest(String wiki, List<String> remoteObservationIds)
+    {
+        this(wiki);
+
+        setRemoteObservationIds(remoteObservationIds);
+    }
+
+    /**
      * @param wikiId the wikiId to set
      */
     public void setWiki(String wikiId)
@@ -72,10 +91,40 @@ public class MissingLiveNotificationMailsRequest extends AbstractRequest
     }
 
     /**
-     * @return the wikiId
+     * @return the wikiId, or {@code null} for all the wikis
      */
     public String getWiki()
     {
         return getProperty(PROPERTY_WIKI);
+    }
+
+    /**
+     * Restricts the events whose mails are resumed to the events produced by some members of the cluster, according
+     * to the remote observation identifier stored in each event (the {@code observation.remote.id} of the member which
+     * produced it, which is also the member which created its mail entities).
+     *
+     * @param remoteObservationIds the remote observation identifiers of the cluster members whose events should be
+     *            resumed, a {@code null} element standing for the events without remote observation identifier, or
+     *            {@code null} for all the events whatever their remote observation identifier (the default)
+     * @since 18.9.0RC1
+     */
+    public void setRemoteObservationIds(List<String> remoteObservationIds)
+    {
+        if (remoteObservationIds != null) {
+            setProperty(PROPERTY_REMOTE_OBSERVATION_IDS, new ArrayList<>(remoteObservationIds));
+        } else {
+            removeProperty(PROPERTY_REMOTE_OBSERVATION_IDS);
+        }
+    }
+
+    /**
+     * @return the remote observation identifiers of the cluster members whose events should be resumed, a
+     *         {@code null} element standing for the events without remote observation identifier, or {@code null} for
+     *         all the events whatever their remote observation identifier
+     * @since 18.9.0RC1
+     */
+    public List<String> getRemoteObservationIds()
+    {
+        return getProperty(PROPERTY_REMOTE_OBSERVATION_IDS);
     }
 }

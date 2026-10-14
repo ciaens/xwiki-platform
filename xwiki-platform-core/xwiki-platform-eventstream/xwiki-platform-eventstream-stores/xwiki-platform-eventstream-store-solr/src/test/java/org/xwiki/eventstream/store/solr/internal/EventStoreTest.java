@@ -779,4 +779,37 @@ class EventStoreTest
 
         assertSearch(Arrays.asList(EVENT3, EVENT4), new SimpleEventQuery());
     }
+
+    @Test
+    void searchMailWithRemoteObservationId() throws EventStreamException, InterruptedException, ExecutionException
+    {
+        // Mail entities of events produced by different cluster members (and without member), as queried by the
+        // resume of the pending live notification mails and by the pre-filtering
+        DefaultEvent eventA = event("ra");
+        eventA.setRemoteObservationId("a");
+        DefaultEvent eventB = event("rb");
+        eventB.setRemoteObservationId("b");
+        DefaultEvent eventNone = event("rn");
+        DefaultEvent eventANoMail = event("ro");
+        eventANoMail.setRemoteObservationId("a");
+
+        this.eventStore.saveEvent(eventA);
+        this.eventStore.saveEvent(eventB);
+        this.eventStore.saveEvent(eventNone);
+        this.eventStore.saveEvent(eventANoMail).get();
+
+        this.eventStore.saveMailEntityEvent(entityevent(eventA, "u"));
+        this.eventStore.saveMailEntityEvent(entityevent(eventB, "u"));
+        this.eventStore.saveMailEntityEvent(entityevent(eventNone, "u")).get();
+
+        assertSearch(List.of(eventA),
+            new SimpleEventQuery().withMail("u").open().eq(Event.FIELD_REMOTE_OBSERVATION_ID, "a").close());
+        assertSearch(List.of(eventNone),
+            new SimpleEventQuery().withMail("u").open().eq(Event.FIELD_REMOTE_OBSERVATION_ID, null).close());
+        assertSearch(List.of(eventA, eventNone), new SimpleEventQuery().withMail("u").open()
+            .eq(Event.FIELD_REMOTE_OBSERVATION_ID, "a").or().eq(Event.FIELD_REMOTE_OBSERVATION_ID, null).close());
+        assertSearch(List.of(eventA, eventNone, eventANoMail), new SimpleEventQuery()
+            .eq(Event.FIELD_PREFILTERED, false).open().eq(Event.FIELD_REMOTE_OBSERVATION_ID, "a").or()
+            .eq(Event.FIELD_REMOTE_OBSERVATION_ID, null).close());
+    }
 }
