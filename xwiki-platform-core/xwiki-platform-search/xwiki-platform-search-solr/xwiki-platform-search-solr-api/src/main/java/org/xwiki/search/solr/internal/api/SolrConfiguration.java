@@ -56,6 +56,20 @@ public interface SolrConfiguration
     String getServerType();
 
     /**
+     * Indicates if the Solr index is shared by all the members of the cluster, in which case a change needs to be sent
+     * to it by only one member, and a task maintaining the whole index needs to run on only one member.
+     * <p>
+     * A remote Solr server ({@code solr.type=remote}) is assumed to be shared by all the members of the cluster, while
+     * an embedded Solr index belongs to the instance running it. Without a cluster, the index is used by a single
+     * instance whatever this method returns.
+     *
+     * @return {@code true} if the Solr index is shared by all the members of the cluster, {@code false} if each
+     *         member has its own index
+     * @since 18.9.0RC1
+     */
+    boolean isIndexShared();
+
+    /**
      * @param instanceType the instance type value for which configuration is requested.
      * @param propertyName the name of the configuration property that is requested.
      * @param defaultValue the default value to return if the requested value is not set.

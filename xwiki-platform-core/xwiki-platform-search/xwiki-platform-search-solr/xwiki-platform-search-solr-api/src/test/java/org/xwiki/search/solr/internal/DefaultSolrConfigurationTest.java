@@ -58,6 +58,22 @@ class DefaultSolrConfigurationTest
     }
 
     @Test
+    void isIndexShared()
+    {
+        when(this.source.getProperty(DefaultSolrConfiguration.SOLR_TYPE_PROPERTY,
+            DefaultSolrConfiguration.SOLR_TYPE_DEFAULT)).thenReturn(DefaultSolrConfiguration.SOLR_TYPE_DEFAULT);
+        assertFalse(this.configuration.isIndexShared());
+
+        when(this.source.getProperty(DefaultSolrConfiguration.SOLR_TYPE_PROPERTY,
+            DefaultSolrConfiguration.SOLR_TYPE_DEFAULT)).thenReturn("embedded");
+        assertFalse(this.configuration.isIndexShared());
+
+        when(this.source.getProperty(DefaultSolrConfiguration.SOLR_TYPE_PROPERTY,
+            DefaultSolrConfiguration.SOLR_TYPE_DEFAULT)).thenReturn("remote");
+        assertTrue(this.configuration.isIndexShared());
+    }
+
+    @Test
     void getIndexerBatchSize()
     {
         when(this.source.getProperty(DefaultSolrConfiguration.SOLR_INDEXER_BATCH_SIZE_PROPERTY,
