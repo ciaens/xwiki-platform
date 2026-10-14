@@ -20,12 +20,14 @@
 package com.xpn.xwiki.internal.observation.remote.converter;
 
 import java.io.Serializable;
+import java.util.Date;
 import java.util.HashMap;
 import java.util.Locale;
 import java.util.Map;
 
 import javax.inject.Inject;
 
+import org.apache.commons.lang3.exception.ExceptionUtils;
 import org.slf4j.Logger;
 import org.xwiki.context.Execution;
 import org.xwiki.context.ExecutionContext;
@@ -35,6 +37,7 @@ import org.xwiki.observation.remote.converter.AbstractEventConverter;
 
 import com.xpn.xwiki.XWikiContext;
 import com.xpn.xwiki.XWikiException;
+import com.xpn.xwiki.doc.XWikiDeletedDocument;
 import com.xpn.xwiki.doc.XWikiDocument;
 import com.xpn.xwiki.store.XWikiCacheStore;
 import com.xpn.xwiki.util.XWikiStubContextProvider;
@@ -60,6 +63,19 @@ public abstract class AbstractXWikiEventConverter extends AbstractEventConverter
     protected static final String ORIGDOC_VERSION = "origdocversion";
 
     protected static final String ORIGDOC_LANGUAGE = "origdoclanguage";
+
+    /**
+     * The date of the original document, in milliseconds. It identifies the original document in the recycle bin when
+     * its version cannot be loaded from the history of the document.
+     *
+     * @since 18.10.0RC1
+     */
+    protected static final String ORIGDOC_DATE = "origdocdate";
+
+    /**
+     * Some databases store dates with a precision of one second.
+     */
+    private static final long DATE_PRECISION = 1000L;
 
     /**
      * The logger to log.
@@ -154,6 +170,9 @@ public abstract class AbstractXWikiEventConverter extends AbstractEventConverter
         if (originalDocument != null && !originalDocument.isNew()) {
             remoteDataMap.put(ORIGDOC_VERSION, originalDocument.getVersion());
             remoteDataMap.put(ORIGDOC_LANGUAGE, originalDocument.getLanguage());
+            if (originalDocument.getDate() != null) {
+                remoteDataMap.put(ORIGDOC_DATE, originalDocument.getDate().getTime());
+            }
         }
 
         return remoteDataMap;
@@ -204,7 +223,8 @@ public abstract class AbstractXWikiEventConverter extends AbstractEventConverter
 
         String origVersion = (String) remoteDataMap.get(ORIGDOC_VERSION);
         if (origVersion != null) {
-            origDoc = getDocument(origDoc, origVersion, xcontext);
+            origDoc = getOriginalDocument(docReference, origLocale, origVersion, (Long) remoteDataMap.get(ORIGDOC_DATE),
+                document.getDate(), xcontext);
         }
 
         // Clone the document to be sure we don't leave an inconsistent document state in the cache
@@ -215,5 +235,166 @@ public abstract class AbstractXWikiEventConverter extends AbstractEventConverter
         document.setOriginalDocument(origDoc);
 
         return document;
+    }
+
+    /**
+     * Load the original document of a remote document event.
+     *
+     * @param reference the reference of the original document
+     * @param locale the locale of the original document
+     * @param version the version of the original document
+     * @param date the date of the original document in milliseconds, {@code null} when the sender did not provide it
+     * @param documentDate the date of the document of the event
+     * @param xcontext the XWiki context
+     * @return the original document, an empty document carrying only the reference and locale when it cannot be found
+     */
+    private XWikiDocument getOriginalDocument(DocumentReference reference, Locale locale, String version, Long date,
+        Date documentDate, XWikiContext xcontext)
+    {
+        try {
+            return getDocument(new XWikiDocument(reference, locale), version, xcontext);
+        } catch (XWikiException e) {
+            DocumentReference referenceWithLocale = new DocumentReference(reference, locale);
+
+            if (!xcontext.getWiki().hasVersioning(xcontext)) {
+                // Without versioning, only the current version of a document is stored
+                this.logger.debug("Failed to load version [{}] of document [{}] (versioning is disabled), an empty"
+                    + " original document is used instead", version, referenceWithLocale, e);
+
+                return new XWikiDocument(reference, locale);
+            }
+
+            if (e.getCode() == XWikiException.ERROR_XWIKI_STORE_HIBERNATE_UNEXISTANT_VERSION) {
+                // When a document is renamed or moved onto an existing document, the replaced document is the original
+                // document of the event, but it was deleted along with its history and the history found at this
+                // reference is now the one of the moved document. The replaced document can still be in the recycle
+                // bin.
+                XWikiDocument deletedDocument =
+                    getDeletedOriginalDocument(reference, locale, version, date, documentDate, xcontext);
+                if (deletedDocument != null) {
+                    return deletedDocument;
+                }
+            } else {
+                this.logger.debug("Failed to load version [{}] of document [{}]", version, referenceWithLocale, e);
+            }
+
+            // Listeners only need the reference of the original document to invalidate what they know about it
+            this.logger.warn("Failed to load version [{}] of document [{}], used as the original document of a remote"
+                + " event, an empty original document is used instead. Root cause: [{}]", version, referenceWithLocale,
+                ExceptionUtils.getRootCauseMessage(e));
+
+            return new XWikiDocument(reference, locale);
+        }
+    }
+
+    /**
+     * Find the original document of a remote document event in the recycle bin.
+     *
+     * @param reference the reference of the original document
+     * @param locale the locale of the original document
+     * @param version the version of the original document
+     * @param date the date of the original document in milliseconds, {@code null} when the sender did not provide it
+     * @param documentDate the date of the document of the event
+     * @param xcontext the XWiki context
+     * @return the most recently deleted document with the passed reference, locale and version (and date when it is
+     *         known), deleted after the document of the event was saved, {@code null} if there is none
+     */
+    private XWikiDocument getDeletedOriginalDocument(DocumentReference reference, Locale locale, String version,
+        Long date, Date documentDate, XWikiContext xcontext)
+    {
+        if (!xcontext.getWiki().hasRecycleBin(xcontext)) {
+            return null;
+        }
+
+        XWikiDeletedDocument[] deletedDocuments;
+        try {
+            deletedDocuments = getDeletedDocuments(reference, locale, xcontext);
+        } catch (XWikiException e) {
+            this.logger.debug("Failed to get the deleted documents [{}] from the recycle bin",
+                new DocumentReference(reference, locale), e);
+
+            return null;
+        }
+
+        // The original document was deleted when the document of the event replaced it, so after the document of the
+        // event was saved: older entries belong to other incarnations of the reference (the most recent come first)
+        long minimumDeletionDate = documentDate != null ? documentDate.getTime() - DATE_PRECISION : Long.MIN_VALUE;
+        for (XWikiDeletedDocument deletedDocument : deletedDocuments) {
+            Date deletionDate = deletedDocument.getDate();
+            if (deletionDate != null && deletionDate.getTime() < minimumDeletionDate) {
+                break;
+            }
+
+            XWikiDocument document;
+            try {
+                document = restoreDeletedDocument(deletedDocument, reference, xcontext);
+            } catch (Exception e) {
+                this.logger.debug("Failed to restore the deleted document with id [{}]", deletedDocument.getId(), e);
+
+                continue;
+            }
+
+            // The date of the original document sent by the other member is the one stored in the recycle bin
+            if (version.equals(document.getVersion())
+                && (date == null || (document.getDate() != null && date == document.getDate().getTime()))) {
+                return document;
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Get the deleted documents with the passed reference and locale from the recycle bin of the wiki of the document.
+     *
+     * @param reference the reference of the deleted document
+     * @param locale the locale of the deleted document
+     * @param xcontext the XWiki context
+     * @return the deleted documents, the most recently deleted first
+     * @throws XWikiException when failing to read the recycle bin
+     * @since 18.10.0RC1
+     */
+    protected XWikiDeletedDocument[] getDeletedDocuments(DocumentReference reference, Locale locale,
+        XWikiContext xcontext) throws XWikiException
+    {
+        // The recycle bin store reads the database of the context wiki
+        String currentWiki = xcontext.getWikiId();
+        xcontext.setWikiId(reference.getWikiReference().getName());
+        try {
+            XWikiDeletedDocument[] deletedDocuments = xcontext.getWiki().getRecycleBinStore()
+                .getAllDeletedDocuments(new XWikiDocument(reference, locale), xcontext, true);
+
+            return deletedDocuments != null ? deletedDocuments : new XWikiDeletedDocument[0];
+        } finally {
+            xcontext.setWikiId(currentWiki);
+        }
+    }
+
+    /**
+     * Restore a document from the recycle bin, without saving it.
+     *
+     * @param deletedDocument the deleted document to restore
+     * @param reference the reference of the deleted document
+     * @param xcontext the XWiki context
+     * @return the restored document
+     * @throws XWikiException when failing to restore the document
+     * @since 18.10.0RC1
+     */
+    protected XWikiDocument restoreDeletedDocument(XWikiDeletedDocument deletedDocument, DocumentReference reference,
+        XWikiContext xcontext) throws XWikiException
+    {
+        // The reference stored in the recycle bin is resolved against the context wiki
+        String currentWiki = xcontext.getWikiId();
+        xcontext.setWikiId(reference.getWikiReference().getName());
+        try {
+            XWikiDocument document = deletedDocument.restoreDocument(xcontext);
+
+            // The document existed before it was deleted
+            document.setNew(false);
+
+            return document;
+        } finally {
+            xcontext.setWikiId(currentWiki);
+        }
     }
 }

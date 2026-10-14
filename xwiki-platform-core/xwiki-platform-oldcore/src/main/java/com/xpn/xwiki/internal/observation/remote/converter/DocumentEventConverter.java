@@ -27,6 +27,7 @@ import java.util.Set;
 import javax.inject.Named;
 import javax.inject.Singleton;
 
+import org.apache.commons.lang3.exception.ExceptionUtils;
 import org.xwiki.bridge.event.DocumentCreatedEvent;
 import org.xwiki.bridge.event.DocumentDeletedEvent;
 import org.xwiki.bridge.event.DocumentUpdatedEvent;
@@ -38,13 +39,11 @@ import org.xwiki.observation.event.Event;
 import org.xwiki.observation.remote.LocalEventData;
 import org.xwiki.observation.remote.RemoteEventData;
 
-import com.xpn.xwiki.XWiki;
 import com.xpn.xwiki.XWikiContext;
 import com.xpn.xwiki.XWikiException;
 import com.xpn.xwiki.doc.XWikiDeletedDocument;
 import com.xpn.xwiki.doc.XWikiDocument;
 import com.xpn.xwiki.store.XWikiCacheStore;
-import com.xpn.xwiki.store.XWikiRecycleBinStoreInterface;
 
 /**
  * Convert all document event to remote events and back to local events.
@@ -91,25 +90,68 @@ public class DocumentEventConverter extends AbstractXWikiEventConverter
             // fill the local event
             XWikiContext xcontext = unserializeXWikiContext(remoteEvent.getData());
 
-            try {
-                if (xcontext != null) {
-                    localEvent.setData(xcontext);
-                    localEvent.setEvent((Event) remoteEvent.getEvent());
-
+            if (xcontext != null) {
+                XWikiDocument source;
+                try {
                     if (remoteEvent.getEvent() instanceof DocumentDeletedEvent) {
-                        localEvent.setSource(unserializeDeletedDocument(remoteEvent.getSource(), xcontext));
+                        source = unserializeDeletedDocument(remoteEvent.getSource(), xcontext);
                     } else {
-                        localEvent.setSource(unserializeDocument(remoteEvent.getSource()));
+                        source = unserializeDocument(remoteEvent.getSource());
                     }
+                } catch (XWikiException e) {
+                    this.logger.error("Failed to convert remote event [{}], it is delivered with the current version of"
+                        + " the document and an empty original document", remoteEvent, e);
+
+                    // Listeners expect a source
+                    source = unserializeCurrentDocument(remoteEvent.getSource(), xcontext);
                 }
-            } catch (XWikiException e) {
-                this.logger.error("Failed to convert remote event [{}]", remoteEvent, e);
+
+                localEvent.setData(xcontext);
+                localEvent.setEvent((Event) remoteEvent.getEvent());
+                localEvent.setSource(source);
             }
 
             return true;
         }
 
         return false;
+    }
+
+    /**
+     * Load the current version of the serialized document, with an empty original document carrying only the reference
+     * and locale of the serialized original document.
+     * <p>
+     * Some listeners register what a document contains (wiki macros, wiki components) and would unregister it if they
+     * were given an empty document, so the current version is used when available. When it cannot be loaded either, the
+     * document carries only the reference and locale of the serialized document.
+     *
+     * @param remoteData the serialized version of the document
+     * @param xcontext the XWiki context
+     * @return the document
+     */
+    private XWikiDocument unserializeCurrentDocument(Serializable remoteData, XWikiContext xcontext)
+    {
+        Map<String, Serializable> remoteDataMap = (Map<String, Serializable>) remoteData;
+
+        DocumentReference docReference = (DocumentReference) remoteDataMap.get(DOC_NAME);
+        Locale locale = LocaleUtils.toLocale((String) remoteDataMap.get(DOC_LANGUAGE));
+        Locale origLocale = LocaleUtils.toLocale((String) remoteDataMap.get(ORIGDOC_LANGUAGE));
+
+        XWikiDocument document;
+        try {
+            // Clone the document to not modify the one in the cache
+            document = xcontext.getWiki().getDocument(new XWikiDocument(docReference, locale), xcontext).clone();
+        } catch (XWikiException e) {
+            this.logger.warn("Failed to load the current version of document [{}], the remote event is delivered with"
+                + " a document carrying only its reference. Root cause: [{}]", new DocumentReference(docReference,
+                    locale), ExceptionUtils.getRootCauseMessage(e));
+
+            document = new XWikiDocument(docReference, locale);
+        }
+
+        document.setOriginalDocument(new XWikiDocument(docReference, origLocale));
+
+        return document;
     }
 
     private XWikiDocument unserializeDeletedDocument(Serializable remoteData, XWikiContext xcontext)
@@ -123,14 +165,17 @@ public class DocumentEventConverter extends AbstractXWikiEventConverter
         XWikiDocument doc = new XWikiDocument(docReference, locale);
         XWikiDocument origDoc = new XWikiDocument(docReference, locale);
 
+        // Force invalidating the cache to be sure it return (and keep) the right document, before reading the recycle
+        // bin so that a failure to read it does not leave the deleted document in the cache
+        if (xcontext.getWiki().getStore() instanceof XWikiCacheStore cacheStore) {
+            cacheStore.invalidate(doc);
+        }
+
         // We have to get deleted document from the trash (hoping it is in the trash...)
-        XWiki xwiki = xcontext.getWiki();
-        XWikiRecycleBinStoreInterface store = xwiki.getRecycleBinStore();
-        XWikiDeletedDocument[] deletedDocuments = store.getAllDeletedDocuments(origDoc, xcontext, true);
-        if (deletedDocuments != null && deletedDocuments.length > 0) {
-            long index = deletedDocuments[0].getId();
+        XWikiDeletedDocument[] deletedDocuments = getDeletedDocuments(docReference, locale, xcontext);
+        if (deletedDocuments.length > 0) {
             try {
-                origDoc = store.restoreFromRecycleBin(index, xcontext, true);
+                origDoc = restoreDeletedDocument(deletedDocuments[0], docReference, xcontext);
             } catch (Exception e) {
                 // The deleted document can be found in the database but there is an issue with the content
                 // Better a partial notification than no notification at all (what most listeners care about is the
@@ -140,11 +185,6 @@ public class DocumentEventConverter extends AbstractXWikiEventConverter
         }
 
         doc.setOriginalDocument(origDoc);
-
-        // Force invalidating the cache to be sure it return (and keep) the right document
-        if (xcontext.getWiki().getStore() instanceof XWikiCacheStore cacheStore) {
-            cacheStore.invalidate(doc);
-        }
 
         return doc;
     }
