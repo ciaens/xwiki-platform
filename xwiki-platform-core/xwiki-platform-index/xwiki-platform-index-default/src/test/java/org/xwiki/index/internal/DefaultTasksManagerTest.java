@@ -19,15 +19,21 @@
  */
 package org.xwiki.index.internal;
 
+import java.util.ArrayList;
 import java.util.Date;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 import javax.inject.Provider;
 
+import org.apache.commons.lang3.reflect.FieldUtils;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
@@ -53,7 +59,9 @@ import static org.hamcrest.Matchers.matchesPattern;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
@@ -294,5 +302,154 @@ class DefaultTasksManagerTest
         assertEquals(Map.of("typeA", 1L, "typeB", 2L), this.tasksManager.getQueueSizePerType("wikiA"));
         assertEquals(Map.of("typeA", 2L), this.tasksManager.getQueueSizePerType("wikiB"));
         assertEquals(Map.of(), this.tasksManager.getQueueSizePerType("wikiC"));
+    }
+
+    @Test
+    void loadTasks() throws Exception
+    {
+        XWikiDocumentIndexingTask queuedTask = new XWikiDocumentIndexingTask();
+        queuedTask.setTimestamp(new Date());
+        queuedTask.setVersion("1.3");
+        queuedTask.setType("testtask");
+        queuedTask.setDocId(42);
+        XWikiDocumentIndexingTask otherTask = new XWikiDocumentIndexingTask();
+        otherTask.setTimestamp(new Date());
+        otherTask.setVersion("1.1");
+        otherTask.setType("testtask");
+        otherTask.setDocId(43);
+        when(this.tasksStore.getAllTasks("wikiId", INSTANCE_ID)).thenReturn(List.of(queuedTask, otherTask));
+
+        // The task 42 is already queued, before the consumer thread is started
+        this.tasksManager.addTask("wikiId", 42, "1.3", "testtask");
+
+        assertEquals(1, this.tasksManager.loadTasks("wikiId"));
+        assertEquals(2, this.tasksManager.getQueueSize());
+
+        // Loading again adds nothing
+        assertEquals(0, this.tasksManager.loadTasks("wikiId"));
+        assertEquals(2, this.tasksManager.getQueueSize());
+
+        // The loaded tasks are executed once the consumer thread is started
+        when(this.wikiDescriptorManager.getAllIds()).thenReturn(List.of());
+        this.tasksManager.startThread();
+        Thread.sleep(1);
+        this.tasksManager.addTask("wikiId", 44, "1.1", "othertask").get();
+        verify(this.taskExecutor).execute(new TaskData(42, "1.3", "testtask", "wikiId"));
+        verify(this.taskExecutor).execute(new TaskData(43, "1.1", "testtask", "wikiId"));
+    }
+
+    @Test
+    void loadTasksFailure() throws Exception
+    {
+        when(this.tasksStore.getAllTasks("wikiId", INSTANCE_ID)).thenThrow(new XWikiException());
+
+        assertThrows(XWikiException.class, () -> this.tasksManager.loadTasks("wikiId"));
+        assertEquals(0, this.tasksManager.getQueueSize());
+    }
+
+    @Test
+    void initQueueFailure() throws Exception
+    {
+        when(this.wikiDescriptorManager.getAllIds()).thenReturn(List.of("wikiId"));
+        when(this.tasksStore.getAllTasks("wikiId", INSTANCE_ID)).thenThrow(new XWikiException());
+
+        this.tasksManager.run();
+
+        assertEquals(1, this.logCapture.size());
+        assertEquals("Failed to initialize the tasks consumer thread.", this.logCapture.getMessage(0));
+        assertEquals("Failed to get tasks for wiki [wikiId]",
+            this.logCapture.getLogEvent(0).getThrowableProxy().getMessage());
+    }
+
+    /**
+     * Starts the consumer thread and blocks it while it executes the task 42, whose row is in the store.
+     *
+     * @param executed the documents of the executed tasks, in execution order
+     * @param release released to let the execution of the task 42 finish
+     * @param deleted counted down when the row of the task 42 is removed from the store
+     */
+    private void blockOnTask42(List<Long> executed, CountDownLatch release, CountDownLatch deleted) throws Exception
+    {
+        List<XWikiDocumentIndexingTask> rows = new CopyOnWriteArrayList<>();
+        doAnswer(invocation -> rows.add(invocation.getArgument(1))).when(this.tasksStore).addTask(any(), any());
+        doAnswer(invocation -> {
+            long docId = invocation.getArgument(1);
+            rows.removeIf(row -> row.getDocId() == docId);
+            if (docId == 42) {
+                deleted.countDown();
+            }
+            return null;
+        }).when(this.tasksStore).deleteTask(any(), anyLong(), any(), any());
+        when(this.tasksStore.getAllTasks("wikiId", INSTANCE_ID)).thenAnswer(invocation -> new ArrayList<>(rows));
+
+        CountDownLatch executing = new CountDownLatch(1);
+        doAnswer(invocation -> {
+            TaskData task = invocation.getArgument(0);
+            executed.add(task.getDocId());
+            if (task.getDocId() == 42) {
+                executing.countDown();
+                assertTrue(release.await(10, TimeUnit.SECONDS));
+            }
+            return null;
+        }).when(this.taskExecutor).execute(any());
+
+        when(this.wikiDescriptorManager.getAllIds()).thenReturn(List.of());
+        this.tasksManager.startThread();
+        this.tasksManager.addTask("wikiId", 42, "1.1", "mention");
+        assertTrue(executing.await(10, TimeUnit.SECONDS));
+    }
+
+    @Test
+    void loadTasksWhileATaskRuns() throws Exception
+    {
+        List<Long> executed = new CopyOnWriteArrayList<>();
+        CountDownLatch release = new CountDownLatch(1);
+        CountDownLatch deleted = new CountDownLatch(1);
+        blockOnTask42(executed, release, deleted);
+
+        // The row of the running task is still in the store: it's queued again
+        assertEquals(1, this.tasksManager.loadTasks("wikiId"));
+
+        release.countDown();
+        // Wait until the queue is consumed
+        Thread.sleep(1);
+        this.tasksManager.addTask("wikiId", 44, "1.1", "mention").get(10, TimeUnit.SECONDS);
+
+        // The copy was skipped
+        assertEquals(List.of(42L, 44L), executed);
+        verify(this.tasksStore).deleteTask("wikiId", 42, "1.1", "mention");
+    }
+
+    @Test
+    void loadTasksPreventsTheDeletionBetweenTheReadAndTheQueueing() throws Exception
+    {
+        List<Long> executed = new CopyOnWriteArrayList<>();
+        CountDownLatch release = new CountDownLatch(1);
+        CountDownLatch deleted = new CountDownLatch(1);
+        blockOnTask42(executed, release, deleted);
+
+        ReentrantReadWriteLock lock =
+            (ReentrantReadWriteLock) FieldUtils.readField(this.tasksManager, "readWriteLock", true);
+        List<XWikiDocumentIndexingTask> rows = this.tasksStore.getAllTasks("wikiId", INSTANCE_ID);
+        when(this.tasksStore.getAllTasks("wikiId", INSTANCE_ID)).thenAnswer(invocation -> {
+            // The execution of the task 42 finishes while the store is read: the consumer then waits for the lock to
+            // remove the row of the task 42
+            release.countDown();
+            long deadline = System.currentTimeMillis() + 10000;
+            while (!lock.hasQueuedThreads() && System.currentTimeMillis() < deadline) {
+                Thread.onSpinWait();
+            }
+            assertTrue(lock.hasQueuedThreads());
+            assertEquals(1, deleted.getCount());
+            return rows;
+        });
+
+        // Queued again (the row was read before its deletion), but not executed again
+        assertEquals(1, this.tasksManager.loadTasks("wikiId"));
+        assertTrue(deleted.await(10, TimeUnit.SECONDS));
+        Thread.sleep(1);
+        this.tasksManager.addTask("wikiId", 44, "1.1", "mention").get(10, TimeUnit.SECONDS);
+
+        assertEquals(List.of(42L, 44L), executed);
     }
 }

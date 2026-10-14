@@ -265,7 +265,11 @@ public class DefaultTasksManager implements TaskManager, Initializable, Disposab
             this.executionContextManager.initialize(new ExecutionContext());
             // Load the tasks for all wikis.
             for (String wikiId : this.wikiDescriptorManager.getAllIds()) {
-                loadWiki(wikiId);
+                try {
+                    loadWiki(wikiId);
+                } catch (XWikiException e) {
+                    throw new InitializationException(String.format("Failed to get tasks for wiki [%s]", wikiId), e);
+                }
             }
         } catch (WikiManagerException e) {
             throw new InitializationException("Failed to list the wiki IDs.", e);
@@ -274,38 +278,65 @@ public class DefaultTasksManager implements TaskManager, Initializable, Disposab
         }
     }
 
-    private void loadWiki(String wikiId) throws InitializationException
+    /**
+     * Adds to the queue the tasks of a wiki which are stored for the current instance and are not queued yet, for
+     * example after tasks queued by another cluster member were assigned to the current instance (see
+     * {@link TasksStore#reassignTasks(String, String, String, Date, Date)}). The tasks are executed by the consumer
+     * thread once it's started.
+     * <p>
+     * The tasks are read from the store and queued while no task is being added to or removed from the store, so that a
+     * task cannot be removed from the store (after its execution) between the moment it's read and the moment it's
+     * queued, which would make it run again. A task which is being executed when this method is called is still in the
+     * store: it's queued again (and counted in the returned number), but its copy is skipped since the task is not
+     * pending anymore once its execution is over (see the latest timestamps of the queued tasks).
+     *
+     * @param wikiId the wiki whose tasks to load, for example {@code xwiki}
+     * @return the number of tasks added to the queue
+     * @throws XWikiException in case of error when reading the tasks from the store
+     * @since 18.9.0RC1
+     */
+    public int loadTasks(String wikiId) throws XWikiException
     {
+        this.writeLock.lock();
         try {
-            List<XWikiDocumentIndexingTask> tasksInDB = this.tasksStore.get().getAllTasks(wikiId,
-                this.remoteObservationManagerConfiguration.getId());
-
-            // Check for each task if it is already in the queue. This is necessary as tasks might
-            // have been added before this call, see XWIKI-19471.
-            // For this, get a snapshot of all existing tasks. This doesn't include insertions afterwards but that's
-            // not important as they are not in the tasks from the DB, either. For this property to hold, it is
-            // important, though, to first get the tasks from the DB and then from the queue.
-            // Note that if this queried the queue for every task, the running time would be quadratic in the number of
-            // tasks, that's why there is this snapshot in a hash set.
-            Set<TaskData> existingTasks;
-            // Make sure no task is in the DB but not in the queue.
-            this.writeLock.lock();
-            try {
-                existingTasks = new HashSet<>(this.queue);
-            } finally {
-                this.writeLock.unlock();
-            }
-
-            for (XWikiDocumentIndexingTask task : tasksInDB) {
-                TaskData taskData = convert(wikiId, task);
-                if (!existingTasks.contains(taskData)) {
-                    this.latestTimestampTasksMap.computeIfAbsent(taskData, TaskData::getTimestamp);
-                    this.queue.put(taskData);
-                }
-            }
-        } catch (XWikiException e) {
-            throw new InitializationException(String.format("Failed to get tasks for wiki [%s]", wikiId), e);
+            return loadWiki(wikiId);
+        } finally {
+            this.writeLock.unlock();
         }
+    }
+
+    private int loadWiki(String wikiId) throws XWikiException
+    {
+        int added = 0;
+        List<XWikiDocumentIndexingTask> tasksInDB = this.tasksStore.get().getAllTasks(wikiId,
+            this.remoteObservationManagerConfiguration.getId());
+
+        // Check for each task if it is already in the queue. This is necessary as tasks might
+        // have been added before this call, see XWIKI-19471.
+        // For this, get a snapshot of all existing tasks. This doesn't include insertions afterwards but that's
+        // not important as they are not in the tasks from the DB, either. For this property to hold, it is
+        // important, though, to first get the tasks from the DB and then from the queue.
+        // Note that if this queried the queue for every task, the running time would be quadratic in the number of
+        // tasks, that's why there is this snapshot in a hash set.
+        Set<TaskData> existingTasks;
+        // Make sure no task is in the DB but not in the queue.
+        this.writeLock.lock();
+        try {
+            existingTasks = new HashSet<>(this.queue);
+        } finally {
+            this.writeLock.unlock();
+        }
+
+        for (XWikiDocumentIndexingTask task : tasksInDB) {
+            TaskData taskData = convert(wikiId, task);
+            if (!existingTasks.contains(taskData)) {
+                this.latestTimestampTasksMap.computeIfAbsent(taskData, TaskData::getTimestamp);
+                this.queue.put(taskData);
+                added++;
+            }
+        }
+
+        return added;
     }
 
     private TaskData convert(String wikiId, XWikiDocumentIndexingTask task)
