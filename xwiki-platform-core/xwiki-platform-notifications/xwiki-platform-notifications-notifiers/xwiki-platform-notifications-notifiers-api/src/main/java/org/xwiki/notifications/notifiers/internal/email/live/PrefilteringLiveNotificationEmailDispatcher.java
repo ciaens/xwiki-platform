@@ -105,12 +105,18 @@ public class PrefilteringLiveNotificationEmailDispatcher implements Initializabl
     }
 
     /**
+     * Queues the mail of an event for a user, to be sent once the grace time has passed since the event date. While the
+     * event is waiting in the queue, adding it again (for the same or another user) does not queue it twice. Once it
+     * was dispatched, adding it again queues a new mail.
+     *
      * @param event the event to dispatch
      * @param userDocumentReference the reference of the user associated with this event
      */
     public void addEvent(Event event, DocumentReference userDocumentReference)
     {
-        // Optimize a bit the queue to group users associated with the same event
+        // Optimize a bit the queue to group users associated with the same event (the check and the addition are done
+        // atomically so that an event added at the same time by several threads, for example by the resume of the
+        // pending mails and by the pre-filtering, is queued only once)
         synchronized (this.queue) {
             for (QueueEntry entry : this.queue) {
                 if (entry.event.getId().equals(event.getId())) {
@@ -119,16 +125,16 @@ public class PrefilteringLiveNotificationEmailDispatcher implements Initializabl
                     return;
                 }
             }
+
+            QueueEntry entry = new QueueEntry(event, userDocumentReference);
+            this.queue.add(entry);
+
+            Instant instant = event.getDate().toInstant().plusMillis(this.grace);
+            Duration duration = Duration.between(Instant.now(), instant);
+
+            this.processingService.schedule(new ExecutionContextRunnable(this::dispatch, this.componentManager),
+                duration.getSeconds(), TimeUnit.SECONDS);
         }
-
-        QueueEntry entry = new QueueEntry(event, userDocumentReference);
-        this.queue.add(entry);
-
-        Instant instant = event.getDate().toInstant().plusMillis(this.grace);
-        Duration duration = Duration.between(Instant.now(), instant);
-
-        this.processingService.schedule(new ExecutionContextRunnable(this::dispatch, this.componentManager),
-            duration.getSeconds(), TimeUnit.SECONDS);
     }
 
     private void dispatch()

@@ -54,6 +54,7 @@ import org.xwiki.model.reference.WikiReference;
 import org.xwiki.notifications.NotificationConfiguration;
 import org.xwiki.notifications.NotificationFormat;
 import org.xwiki.notifications.filters.internal.DeletedDocumentCleanUpFilterProcessingQueue;
+import org.xwiki.observation.remote.ClusterSingletonManager;
 import org.xwiki.observation.remote.RemoteObservationManagerConfiguration;
 import org.xwiki.user.UserException;
 import org.xwiki.user.UserManager;
@@ -118,6 +119,9 @@ public class UserEventDispatcher
     private RemoteObservationManagerConfiguration remoteObservation;
 
     @Inject
+    private ClusterSingletonManager singletonManager;
+
+    @Inject
     private DeletedDocumentCleanUpFilterProcessingQueue cleanUpFilterProcessingQueue;
 
     @Inject
@@ -132,7 +136,8 @@ public class UserEventDispatcher
     }
 
     /**
-     * Pre-filter any waiting event.
+     * Pre-filter any waiting event produced by the current instance, and the waiting events without remote observation
+     * identifier when the current instance is the cluster singleton node (always the case without cluster).
      * 
      * @throws Exception when failing
      */
@@ -141,30 +146,15 @@ public class UserEventDispatcher
         // Get supported events types
         Set<String> types = getSupportedEventTypes();
 
-        // Create a search request for events produced by the current instance which haven't been pre-filtered yet
-        SimpleEventQuery query = new SimpleEventQuery();
-        // Only events which haven't been pre-filtered already
-        query.eq(Event.FIELD_PREFILTERED, false);
-        query.open();
-        // Events produced by this instance
-        query.eq(Event.FIELD_REMOTE_OBSERVATION_ID, this.remoteObservation.getId());
-        query.or();
-        // Or some old events not containing the remote observation id (or some other reason causing it to be null)
-        query.eq(Event.FIELD_REMOTE_OBSERVATION_ID, null);
-        query.close();
-        // Start by oldest events
-        query.addSort(Event.FIELD_DATE, Order.ASC);
-        // Limit the result to BATCH_SIZE events to not impact the memory too much
-        query.setLimit(BATCH_SIZE);
-
         // Events to ignore
         List<String> failedEvents = new ArrayList<>();
-        query.not().in(Event.FIELD_ID, failedEvents);
 
         // Keep getting the BATCH_SIZE oldest not pre-filtered events (except the handled ones) until we cannot find any
         // left
         do {
-            try (EventSearchResult result = this.events.search(query)) {
+            // The query is created for each batch since the current instance might become or stop being the cluster
+            // singleton node in the meantime
+            try (EventSearchResult result = this.events.search(createFlushQuery(failedEvents))) {
                 if (result.getSize() == 0) {
                     break;
                 }
@@ -188,6 +178,35 @@ public class UserEventDispatcher
                 }
             }
         } while (true);
+    }
+
+    private SimpleEventQuery createFlushQuery(List<String> failedEvents)
+    {
+        // Create a search request for events produced by the current instance which haven't been pre-filtered yet
+        SimpleEventQuery query = new SimpleEventQuery();
+        // Only events which haven't been pre-filtered already
+        query.eq(Event.FIELD_PREFILTERED, false);
+        if (this.singletonManager.isSingletonNode()) {
+            query.open();
+            // Events produced by this instance
+            query.eq(Event.FIELD_REMOTE_OBSERVATION_ID, this.remoteObservation.getId());
+            query.or();
+            // Or some old events not containing the remote observation id (or some other reason causing it to be
+            // null), which are pre-filtered by a single member of the cluster (by the only instance without cluster)
+            query.eq(Event.FIELD_REMOTE_OBSERVATION_ID, null);
+            query.close();
+        } else {
+            // Events produced by this instance
+            query.eq(Event.FIELD_REMOTE_OBSERVATION_ID, this.remoteObservation.getId());
+        }
+        // Start by oldest events
+        query.addSort(Event.FIELD_DATE, Order.ASC);
+        // Limit the result to BATCH_SIZE events to not impact the memory too much
+        query.setLimit(BATCH_SIZE);
+        // Ignore the events which failed to be pre-filtered
+        query.not().in(Event.FIELD_ID, failedEvents);
+
+        return query;
     }
 
     private CompletableFuture<?> prefilterEvent(Event event, Set<String> types) throws EventStreamException
