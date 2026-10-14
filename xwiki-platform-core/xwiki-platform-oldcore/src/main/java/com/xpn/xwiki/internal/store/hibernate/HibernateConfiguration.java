@@ -19,6 +19,7 @@
  */
 package com.xpn.xwiki.internal.store.hibernate;
 
+import java.time.Duration;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Optional;
@@ -51,6 +52,10 @@ public class HibernateConfiguration
     @Inject
     @Named(XWikiCfgConfigurationSource.ROLEHINT)
     private ConfigurationSource xwikiConfiguration;
+
+    @Inject
+    @Named("xwikiproperties")
+    private ConfigurationSource xwikiProperties;
 
     @Inject
     @Named("relative")
@@ -141,6 +146,18 @@ public class HibernateConfiguration
     private List<String> getList(String key)
     {
         return Arrays.asList(StringUtils.split(this.xwikiConfiguration.getProperty(key, ""), " ,"));
+    }
+
+    /**
+     * @return the maximum time to wait for the lock which prevents several cluster members from initializing or
+     *         migrating the database at the same time, {@link Duration#ZERO} (the default) to wait as long as needed
+     * @since 18.10.0RC1
+     */
+    public Duration getMigrationLockTimeout()
+    {
+        long seconds = this.xwikiProperties.getProperty("store.migration.lockTimeout", 0L);
+
+        return seconds > 0 ? Duration.ofSeconds(seconds) : Duration.ZERO;
     }
 
     /**

@@ -19,12 +19,16 @@
  */
 package org.xwiki.store.hibernate.internal;
 
+import java.time.Duration;
+
 import org.junit.jupiter.api.Test;
 import org.xwiki.test.junit5.mockito.ComponentTest;
 import org.xwiki.test.junit5.mockito.InjectMockComponents;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * Validate {@link HSQLDBHibernateAdapter}.
@@ -44,5 +48,17 @@ class HSQLDBHibernateAdapterTest
         assertEquals("ASE_PAGE", this.adapter.getColumnName("ase_page"));
         assertEquals("ASE_PAGE", this.adapter.getColumnName("ASE_PAGE"));
         assertNull(this.adapter.getColumnName(null));
+    }
+
+    @Test
+    void locksAreNotSupported() throws Exception
+    {
+        // Without locks shared by the processes, acquiring always succeeds and there is no lock to lose
+        assertFalse(this.adapter.isLockSupported());
+        assertTrue(this.adapter.tryLock("lock", Duration.ZERO));
+        assertTrue(this.adapter.tryLock("lock", Duration.ZERO));
+        assertTrue(this.adapter.isLockHeld("lock"));
+        this.adapter.unlock("lock");
+        assertTrue(this.adapter.isLockHeld("lock"));
     }
 }

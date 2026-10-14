@@ -19,6 +19,11 @@
  */
 package org.xwiki.store.hibernate.internal;
 
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.time.Duration;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -26,6 +31,7 @@ import java.util.Map;
 import javax.inject.Named;
 import javax.inject.Singleton;
 
+import org.apache.commons.codec.digest.DigestUtils;
 import org.apache.commons.lang3.StringUtils;
 import org.hibernate.Session;
 import org.hibernate.boot.Metadata;
@@ -51,6 +57,11 @@ public class MySQLHibernateAdapter extends AbstractHibernateAdapter
      * The role hint of the component.
      */
     public static final String HINT = "mysql";
+
+    /**
+     * The maximum length of the name of a lock acquired with {@code GET_LOCK()}.
+     */
+    private static final int LOCK_NAME_MAX_LENGTH = 64;
 
     @Override
     public void updateDatabaseAfter(Metadata metadata, Session session) throws HibernateStoreException
@@ -182,5 +193,52 @@ public class MySQLHibernateAdapter extends AbstractHibernateAdapter
     public boolean isCompressionAllowed()
     {
         return getCompressionAllowedConfiguration().orElse(true);
+    }
+
+    @Override
+    public boolean isLockSupported()
+    {
+        return true;
+    }
+
+    @Override
+    protected String getLockName(String name)
+    {
+        // The locks acquired with GET_LOCK() are shared by all the databases of the server and their name is limited
+        // to 64 characters: replace a longer name by its hash (64 hexadecimal characters)
+        String lockName = super.getLockName(name);
+
+        return lockName.length() > LOCK_NAME_MAX_LENGTH ? DigestUtils.sha256Hex(lockName) : lockName;
+    }
+
+    @Override
+    protected boolean acquireLock(Connection connection, String lockName, Duration timeout) throws SQLException
+    {
+        // GET_LOCK() blocks the request until the lock is acquired or the timeout expires (60 seconds at most for the
+        // migration lock, which is requested again until the configured timeout): a socketTimeout of the JDBC URL
+        // lower than that makes the request fail with an exception instead of waiting
+        try (PreparedStatement statement = connection.prepareStatement("SELECT GET_LOCK(?, ?)")) {
+            statement.setString(1, lockName);
+            // GET_LOCK() takes a number of seconds (a negative one means forever)
+            statement.setLong(2, (timeout.toMillis() + 999) / 1000);
+            try (ResultSet result = statement.executeQuery()) {
+                // 1 when acquired, 0 after the timeout, NULL on error
+                return result.next() && result.getInt(1) == 1;
+            }
+        }
+    }
+
+    @Override
+    protected void releaseLock(Connection connection, String lockName) throws SQLException
+    {
+        try (PreparedStatement statement = connection.prepareStatement("SELECT RELEASE_LOCK(?)")) {
+            statement.setString(1, lockName);
+            try (ResultSet result = statement.executeQuery()) {
+                // 1 when released, 0 when held by another connection, NULL when not held
+                if (!result.next() || result.getInt(1) != 1) {
+                    this.logger.warn("The database lock [{}] was not held anymore when releasing it", lockName);
+                }
+            }
+        }
     }
 }

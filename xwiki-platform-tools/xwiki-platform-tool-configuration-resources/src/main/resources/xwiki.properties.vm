@@ -1240,6 +1240,25 @@ store.file.directory=$xwikiPropertiesStoreFileDirectory
 #-# The default is "filesystem".
 # store.blobMigrationStoreType = filesystem
 
+#-# [Since 18.10.0RC1]
+#-# On PostgreSQL, MySQL and MariaDB, a cluster member initializes an empty database or runs the schema updates and
+#-# data migrations (see xwiki.store.migration in xwiki.cfg) only while holding a lock of the database server, so that
+#-# several cluster members never do it at the same time. The other cluster members wait for that lock, then read the
+#-# version of the database again and skip what has already been done. This is the maximum time to wait for the lock,
+#-# in seconds: after it, the database is not used and the next access to it tries again. The lock is released by the
+#-# database server when the connection of its holder is lost (for example when the holder is killed). Note that the
+#-# lock is held on a connection of the pool, so it does not work through a connection pooler in transaction mode
+#-# (for example PgBouncer) or across the nodes of a multi-primary database cluster (for example Galera). The lock is
+#-# also released when its connection is closed while it's idle, by an idle timeout of the database server (for
+#-# example wait_timeout on MySQL and MariaDB, idle_session_timeout on PostgreSQL) or of a proxy or of the network.
+#-# Before migrating each wiki, the cluster member holding the lock checks that the connection of the lock is still
+#-# open, and stops its migration with an error when it's not, instead of continuing at the same time as another
+#-# cluster member which may have acquired the lock meanwhile. The migration of a single wiki is not checked, so such
+#-# timeouts must be longer than it.
+#-#
+#-# The default is 0, which means waiting as long as needed (a log message is written every minute).
+# store.migration.lockTimeout = 0
+
 #-------------------------------------------------------------------------------------
 # S3 Blob Store
 #-------------------------------------------------------------------------------------
