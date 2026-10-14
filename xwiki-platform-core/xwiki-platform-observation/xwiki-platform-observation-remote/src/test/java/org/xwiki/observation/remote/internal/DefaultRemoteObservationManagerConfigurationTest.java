@@ -88,4 +88,17 @@ class DefaultRemoteObservationManagerConfigurationTest
 
         assertEquals("wiki1", this.remoteObservationManagerConfiguration.getClusterName());
     }
+
+    @Test
+    void getReclaimDelayAndMaxAge()
+    {
+        assertEquals(900L, this.remoteObservationManagerConfiguration.getReclaimDelay());
+        assertEquals(86400L, this.remoteObservationManagerConfiguration.getReclaimMaxAge());
+
+        this.configurationSource.setProperty("observation.remote.reclaimDelay", 120L);
+        this.configurationSource.setProperty("observation.remote.reclaimMaxAge", -1L);
+
+        assertEquals(120L, this.remoteObservationManagerConfiguration.getReclaimDelay());
+        assertEquals(-1L, this.remoteObservationManagerConfiguration.getReclaimMaxAge());
+    }
 }
