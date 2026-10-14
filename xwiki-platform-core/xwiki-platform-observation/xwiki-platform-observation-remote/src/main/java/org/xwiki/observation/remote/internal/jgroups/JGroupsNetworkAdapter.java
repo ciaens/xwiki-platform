@@ -20,6 +20,8 @@
 package org.xwiki.observation.remote.internal.jgroups;
 
 import java.text.MessageFormat;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 
 import javax.inject.Inject;
@@ -31,6 +33,7 @@ import org.jgroups.BytesMessage;
 import org.jgroups.Message;
 import org.slf4j.Logger;
 import org.xwiki.component.annotation.Component;
+import org.xwiki.component.annotation.DisposePriority;
 import org.xwiki.component.manager.ComponentLifecycleException;
 import org.xwiki.component.phase.Disposable;
 import org.xwiki.observation.remote.NetworkAdapter;
@@ -46,6 +49,11 @@ import org.xwiki.observation.remote.RemoteEventException;
 @Component
 @Named("jgroups")
 @Singleton
+// The channels are closed as late as possible when the application stops: after the job executor (priority 100, it
+// waits for the running jobs) and the components with the default priority (1000, for example the mail sender, which
+// may still produce events while they stop) but before the stores (10000, Hibernate, Solr, Infinispan) which the
+// listeners of the last events may still need
+@DisposePriority(9000)
 public class JGroupsNetworkAdapter implements NetworkAdapter, Disposable
 {
     @Inject
@@ -125,13 +133,23 @@ public class JGroupsNetworkAdapter implements NetworkAdapter, Disposable
 
     private void internalStopAll()
     {
-        for (Map.Entry<String, JGroupsNetworkChannel> channelEntry : this.channels.getChannels().entrySet()) {
-            stopChannel(channelEntry.getValue());
+        // Each channel is removed from the registry before being stopped so that it cannot be stopped twice (the
+        // channels may be stopped both by #stopAllChannels() and by #dispose())
+        List<JGroupsNetworkChannel> channelsToStop = new ArrayList<>();
+        for (String channelId : List.copyOf(this.channels.getChannels().keySet())) {
+            JGroupsNetworkChannel channel = this.channels.getChannels().remove(channelId);
+            if (channel != null) {
+                channelsToStop.add(channel);
+            }
         }
 
-        this.channels.getChannels().clear();
+        if (!channelsToStop.isEmpty()) {
+            for (JGroupsNetworkChannel channel : channelsToStop) {
+                stopChannel(channel);
+            }
 
-        this.logger.info("All channels stopped");
+            this.logger.info("All channels stopped");
+        }
     }
 
     @Override
