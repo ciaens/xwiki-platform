@@ -193,6 +193,18 @@ xwiki.store.migration=1
 #-# [Since 3.3M1] default to migrate all databases
 # xwiki.store.migration.databases=all
 
+#-# [Since 18.10.0RC1]
+#-# XWiki refuses to use a database migrated by a more recent version of XWiki (for example after a downgrade, or
+#-# when a cluster member running an older version is started after a more recent one migrated the database): the
+#-# older version could undo schema changes and could not read or write the data in its new format. Downgrading XWiki
+#-# requires a new installation and the import of a XAR export. The data migrations of the installed extensions count
+#-# too: when a data migration of an extension which is no longer installed (or which failed to load) brought a
+#-# database to a version higher than the ones known by XWiki, that database is refused as well, until the extension
+#-# is installed again. The members of a cluster need the same extensions.
+#-# The version of the databases (the one stored in their xwikidbversion table) can be forced with the following
+#-# property, at your own risk: it's also used as the current version by the data migrations. Remove it afterwards.
+# xwiki.store.migration.version=
+
 #---------------------------------------
 # Internationalization
 #

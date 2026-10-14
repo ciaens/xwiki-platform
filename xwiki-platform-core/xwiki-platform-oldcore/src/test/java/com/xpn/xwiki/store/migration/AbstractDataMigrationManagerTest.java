@@ -61,8 +61,8 @@ import static org.mockito.Mockito.when;
 
 /**
  * Validate the database initialization and migration paths of {@link AbstractDataMigrationManager}: the database
- * lock shared by the cluster members, the version read again once the lock is held, and the outdated database read
- * again by the members which don't migrate it.
+ * lock shared by the cluster members, the version read again once the lock is held, the outdated database read again
+ * by the members which don't migrate it, and the refusal of a database newer than the code.
  *
  * @version $Id$
  */
@@ -72,6 +72,12 @@ class AbstractDataMigrationManagerTest
     private static final String MAIN_WIKI = "xwiki";
 
     private static final String SUBWIKI = "subwiki";
+
+    private static final String NEWER_DATABASE_MESSAGE = "Database [xwiki] is in version [300], newer than the"
+        + " version [200] supported by this XWiki: it was migrated by a more recent version of XWiki, or by a data"
+        + " migration of an extension that is no longer installed, and could not be safely used! Downgrading XWiki"
+        + " requires a new installation and the import of a XAR export (the version of the database can be forced with"
+        + " xwiki.store.migration.version in xwiki.cfg, at your own risk).";
 
     @RegisterExtension
     private LogCaptureExtension logCapture = new LogCaptureExtension(LogLevel.WARN);
@@ -125,6 +131,11 @@ class AbstractDataMigrationManagerTest
         final Deque<Boolean> heldAnswers = new ArrayDeque<>();
 
         int lockChecks;
+
+        /**
+         * The versions of the forced migrations.
+         */
+        final List<Integer> forcedMigrations = new ArrayList<>();
 
         /**
          * The result of the next lock requests (acquired when empty).
@@ -181,6 +192,17 @@ class AbstractDataMigrationManagerTest
         protected List<DataMigration> getAllMigrations()
         {
             return List.of(createMigration(100), createMigration(200));
+        }
+
+        @Override
+        protected Map<XWikiDBVersion, XWikiMigration> getForcedMigrations()
+        {
+            Map<XWikiDBVersion, XWikiMigration> migrations = new HashMap<>();
+            for (int version : this.forcedMigrations) {
+                migrations.put(new XWikiDBVersion(version), new XWikiMigration(createMigration(version), true));
+            }
+
+            return migrations;
         }
 
         @Override
@@ -570,5 +592,101 @@ class AbstractDataMigrationManagerTest
             + " version [100] while the required version is [200].", exception.getMessage());
         assertFalse(this.manager.getDataMigrationStatus().hasBeenSuccessfullyMigrated());
         assertEquals(List.of("lock 0", "unlock"), this.manager.calls);
+    }
+
+    @Test
+    void newerDatabaseIsRefused() throws Exception
+    {
+        this.manager.database.put(MAIN_WIKI, 300);
+
+        DataMigrationException exception =
+            assertThrows(DataMigrationException.class, () -> this.manager.checkDatabase());
+
+        assertEquals(NEWER_DATABASE_MESSAGE, exception.getMessage());
+        assertEquals(List.of(), this.manager.calls);
+    }
+
+    @Test
+    void newerDatabaseIsNotMigrated() throws Exception
+    {
+        enableMigrations();
+        this.manager.database.put(MAIN_WIKI, 300);
+
+        DataMigrationException exception =
+            assertThrows(DataMigrationException.class, () -> this.manager.checkDatabase());
+
+        // The schema of a newer database is not updated, and its version is left as is
+        assertEquals("Main wiki database migration failed, it is not safe to continue!", exception.getMessage());
+        assertEquals(List.of("lock 0", "unlock"), this.manager.calls);
+        assertEquals(300, this.manager.database.get(MAIN_WIKI));
+        assertEquals("Failed to migrate database [xwiki]...", this.logCapture.getMessage(0));
+        assertEquals("Main wiki database migration failed, it is not safe to continue!",
+            this.logCapture.getMessage(1));
+
+        exception = assertThrows(DataMigrationException.class, () -> this.manager.checkDatabase());
+        assertEquals(NEWER_DATABASE_MESSAGE, exception.getMessage());
+    }
+
+    @Test
+    void newerDatabaseAllowedWithForcedVersion() throws Exception
+    {
+        when(this.hibernateConfiguration.getMigrationVersion()).thenReturn("200");
+        this.manager.database.put(MAIN_WIKI, 300);
+
+        this.manager.checkDatabase();
+
+        assertEquals(200, this.manager.getDBVersion().getVersion());
+    }
+
+    @Test
+    void forcedMigrationOlderThanTheDatabase() throws Exception
+    {
+        enableMigrations();
+        this.manager.forcedMigrations.add(100);
+        this.manager.initialize();
+        this.manager.database.put(MAIN_WIKI, 200);
+
+        this.manager.checkDatabase();
+
+        // The forced migration runs again and the database stays in its version
+        assertEquals(List.of("lock 0", "schema xwiki", "migrate 100 xwiki", "unlock"), this.manager.calls);
+        assertEquals(200, this.manager.database.get(MAIN_WIKI));
+        this.manager.checkDatabase();
+        assertEquals(100, this.manager.getLatestVersion().getVersion());
+    }
+
+    @Test
+    void newerDatabaseIsRefusedWithForcedMigrations() throws Exception
+    {
+        this.manager.forcedMigrations.add(100);
+        this.manager.initialize();
+        this.manager.database.put(MAIN_WIKI, 300);
+
+        DataMigrationException exception =
+            assertThrows(DataMigrationException.class, () -> this.manager.checkDatabase());
+
+        // Compared with the latest version of all the migrations, not only the forced ones
+        assertEquals(NEWER_DATABASE_MESSAGE, exception.getMessage());
+    }
+
+    @Test
+    void latestMigrationIgnoredOnADatabaseAlreadyInItsVersion() throws Exception
+    {
+        enableMigrations();
+        when(this.hibernateConfiguration.getIgnoredMigrations()).thenReturn(List.of("200"));
+        this.manager.initialize();
+        this.manager.database.put(MAIN_WIKI, 200);
+
+        this.manager.checkDatabase();
+
+        assertEquals(List.of("lock 0", "schema xwiki", "unlock"), this.manager.calls);
+        assertEquals(200, this.manager.database.get(MAIN_WIKI));
+        this.manager.checkDatabase();
+
+        // Also when the migrations are disabled
+        when(this.hibernateConfiguration.isMigrationEnabled()).thenReturn(false);
+        this.xcontext.setWikiId(SUBWIKI);
+        this.manager.database.put(SUBWIKI, 200);
+        this.manager.checkDatabase();
     }
 }
