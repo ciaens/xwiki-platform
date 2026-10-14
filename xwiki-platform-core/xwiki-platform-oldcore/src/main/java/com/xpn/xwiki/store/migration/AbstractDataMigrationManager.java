@@ -310,6 +310,12 @@ public abstract class AbstractDataMigrationManager implements DataMigrationManag
     private XWikiDBVersion targetVersion;
 
     /**
+     * The highest version of all the known data migrations, including the forced and ignored ones, null when there is
+     * none. A database in a higher version was migrated by a more recent version of XWiki (or of an extension).
+     */
+    private XWikiDBVersion latestKnownVersion;
+
+    /**
      * Internal class used to clean the database version cache on wiki deletion.
      */
     private final class WikiDeletedEventListener implements EventListener
@@ -414,6 +420,11 @@ public abstract class AbstractDataMigrationManager implements DataMigrationManag
 
             this.targetVersion = !availableMigrations.isEmpty() ? availableMigrations.lastKey() : new XWikiDBVersion(0);
             this.migrations = availableMigrations.values();
+
+            // Forced migrations replace the list of migrations and ignored ones are removed from it: they don't
+            // change the versions this XWiki knows
+            this.latestKnownVersion = getAllMigrations().stream().map(DataMigration::getVersion)
+                .max(XWikiDBVersion::compareTo).orElse(null);
         } catch (Exception e) {
             throw new InitializationException("Migration Manager initialization failed", e);
         }
@@ -854,6 +865,8 @@ public abstract class AbstractDataMigrationManager implements DataMigrationManag
     {
         DataMigrationStatus status = getDataMigrationStatus();
 
+        checkNotNewer(status.getDBVersion());
+
         if (getLatestVersion().compareTo(status.getDBVersion()) > 0) {
             status = recheckOutdatedDb(status);
         }
@@ -873,6 +886,27 @@ public abstract class AbstractDataMigrationManager implements DataMigrationManag
                     getXWikiContext().getWikiId(), status.getDBVersion().getVersion(), getLatestVersion().getVersion());
                 throw new MigrationRequiredException(message);
             }
+        }
+    }
+
+    /**
+     * Refuse a database migrated by a more recent version of XWiki: the schema updates of this version could revert
+     * the changes of the more recent one, and this version could not read or write the data in its new format. The
+     * database version is compared with the highest version of all the known data migrations (including the ones of
+     * the installed extensions), whatever the forced and ignored migrations.
+     *
+     * @param version the version of the database
+     * @throws DataMigrationException when the database is newer than this version of XWiki supports
+     */
+    private void checkNotNewer(XWikiDBVersion version) throws DataMigrationException
+    {
+        if (version != null && this.latestKnownVersion != null && version.compareTo(this.latestKnownVersion) > 0) {
+            throw new DataMigrationException(String.format("Database [%s] is in version [%d], newer than the version"
+                + " [%d] supported by this XWiki: it was migrated by a more recent version of XWiki, or by a data"
+                + " migration of an extension that is no longer installed, and could not be safely used! Downgrading"
+                + " XWiki requires a new installation and the import of a XAR export (the version of the database can"
+                + " be forced with xwiki.store.migration.version in xwiki.cfg, at your own risk).",
+                getXWikiContext().getWikiId(), version.getVersion(), this.latestKnownVersion.getVersion()));
         }
     }
 
@@ -1061,6 +1095,9 @@ public abstract class AbstractDataMigrationManager implements DataMigrationManag
             // database.
             context.setWikiId(database);
             context.setOriginalWikiId(database);
+
+            // Don't update the schema of a database migrated by a more recent version of XWiki
+            checkNotNewer(getDBVersion());
 
             Collection<XWikiMigration> neededMigrations = getNeededMigrations();
             updateSchema(neededMigrations);
