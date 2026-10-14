@@ -797,6 +797,19 @@ extension.versioncheck.environment.enabled=$xwikiPropertiesEnvironmentVersionChe
 # extension.ignoredDependencies=xml-apis:xml-apis
 # extension.ignoredDependencies=xerces:xmlParserAPIs
 
+#-# [Since 18.9.0RC1]
+#-# With a remote Solr server (solr.type=remote) in a cluster, the extension index is shared by all the members, so
+#-# the extension indexing (at startup and then every hour), the cleanup of the extension index at startup and the
+#-# security scan of the installed extensions run only on the cluster singleton node (see
+#-# observation.remote.singletonPriority; it should be the member whose installed extensions are authoritative, for
+#-# example the member which ran the Distribution Wizard). An administrator can still start an indexing from any member.
+#-# This property is the number of seconds a member which becomes the cluster singleton node after its startup waits
+#-# before indexing the extensions (the previous singleton node may have stopped in the middle of an indexing). Nothing
+#-# is done if the member is not the singleton node anymore when the delay expires, so a short restart of the preferred
+#-# member does not trigger an indexing on another member. 0 indexes immediately.
+#-# The default is:
+# extension.index.indexOnSingletonGainDelay=300
+
 #-------------------------------------------------------------------------------------
 # Repository
 #-------------------------------------------------------------------------------------

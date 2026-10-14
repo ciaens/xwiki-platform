@@ -19,6 +19,8 @@
  */
 package org.xwiki.extension.security.internal;
 
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
 import org.junit.jupiter.api.BeforeEach;
@@ -36,9 +38,11 @@ import org.xwiki.test.junit5.mockito.MockComponent;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.any;
 import static org.mockito.Mockito.anyString;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -93,6 +97,51 @@ class ExtensionSecuritySchedulerTest
         assertTrue(this.scheduler.start().get(20, TimeUnit.SECONDS));
         verify(this.extensionSecurityConfiguration).isSecurityScanEnabled();
         verify(this.jobExecutor).execute(ExtensionSecurityJob.JOBTYPE, new ExtensionSecurityRequest());
+    }
+
+    @Test
+    void stop() throws Exception
+    {
+        when(this.extensionSecurityConfiguration.isSecurityScanEnabled()).thenReturn(true);
+        assertTrue(this.scheduler.start().get(20, TimeUnit.SECONDS));
+        verify(this.jobExecutor).execute(ExtensionSecurityJob.JOBTYPE, new ExtensionSecurityRequest());
+
+        this.scheduler.stop();
+
+        // A stopped scheduler is not restarted when the delay changes
+        assertNull(this.scheduler.restart());
+
+        // Starting it again triggers a new scan
+        assertTrue(this.scheduler.start().get(20, TimeUnit.SECONDS));
+        verify(this.jobExecutor, times(2)).execute(ExtensionSecurityJob.JOBTYPE, new ExtensionSecurityRequest());
+
+        // Stopping twice is harmless
+        this.scheduler.stop();
+        this.scheduler.stop();
+        this.scheduler.dispose();
+    }
+
+    @Test
+    void disposeInterruptsTheScanOfAStoppedScheduler() throws Exception
+    {
+        when(this.extensionSecurityConfiguration.isSecurityScanEnabled()).thenReturn(true);
+        CountDownLatch joinStarted = new CountDownLatch(1);
+        doAnswer(invocation -> {
+            joinStarted.countDown();
+            // Interrupted by the dispose
+            Thread.sleep(TimeUnit.MINUTES.toMillis(5));
+            return null;
+        }).when(this.mock).join();
+
+        CompletableFuture<Boolean> future = this.scheduler.start();
+        assertTrue(joinStarted.await(20, TimeUnit.SECONDS));
+
+        // The running scan is not interrupted by the stop, but by the dispose
+        this.scheduler.stop();
+        assertFalse(future.isDone());
+        this.scheduler.dispose();
+
+        assertTrue(future.get(20, TimeUnit.SECONDS));
     }
 
     @Test
